@@ -158,7 +158,7 @@ install_xray() {
         *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
     esac
 
-    # 下载sing-box,cloudflared
+    # 下载xray,cloudflared
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
     curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip"
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
@@ -176,8 +176,8 @@ install_xray() {
     command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
 
     output=$(/etc/xray/xray x25519)
-    private_key=$(echo "$output" | grep "Private key" | awk '{print $3}')
-    public_key=$(echo "$output" | grep "Public key" | awk '{print $3}')
+    private_key=$(echo "${output}" | grep "PrivateKey:" | awk '{print $2}')
+    public_key=$(echo "${output}" | grep "Password:" | awk '{print $2}')
 
    # 生成配置文件
 cat > "${config_dir}" << EOF
