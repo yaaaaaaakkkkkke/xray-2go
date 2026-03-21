@@ -17,7 +17,7 @@ Debian / Ubuntu / CentOS / Alpine / Fedora / AlmaLinux / Rocky Linux / Amazon Li
 
 **一键安装（交互菜单）**
 ```bash
-bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh)
+bash <(curl -Ls [https://github.com/eooce/xray-2go/raw/main/xray_2go.sh](https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh))
 ```
 
 **带变量运行（无交互，修改为自己的参数）**
