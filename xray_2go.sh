@@ -188,28 +188,48 @@ cat > "${config_dir}" << EOF
       "port": $ARGO_PORT,
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "$UUID"}],
+        "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
         "decryption": "none",
         "fallbacks": [
-          { "path": "/vless-argo", "dest": 1127 },
+          { "dest": 3001 }, { "path": "/vless-argo", "dest": 3002 },
+          { "path": "/vmess-argo", "dest": 3003 }
         ]
       },
       "streamSettings": { "network": "tcp" }
     },
     {
-      "port": 1127, "listen": "127.0.0.1", "protocol": "vless",
+      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
+      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
+      "streamSettings": { "network": "tcp", "security": "none" }
+    },
+    {
+      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID", "level": 0 }], "decryption": "none" },
       "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+    },
+    {
+      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
+      "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
+    },
+    {
+      "listen":"::","port": $XHTTP_PORT, "protocol": "vless","settings": {"clients": [{"id": "$UUID"}],"decryption": "none"},
+      "streamSettings": {"network": "xhttp","security": "reality","realitySettings": {"target": "www.nazhumi.com:443","xver": 0,"serverNames": 
+      ["www.nazhumi.com"],"privateKey": "$private_key","shortIds": [""]}},"sniffing": {"enabled": true,"destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$GRPC_PORT,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.iij.ad.jp:443","serverNames":["www.iij.ad.jp"],
+      "privateKey":"$private_key","shortIds":[""]},"grpcSettings":{"serviceName":"grpc"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     },
 	{
       "port": 80,
       "protocol": "vless",
       "settings": {
         "clients": [
-          {
-            "id": "85cb4dc6-5abb-49ea-a5dc-117d9a29982b"
-          }
+          {"id": "$UUID"}
         ],
         "decryption": "none"
       },
