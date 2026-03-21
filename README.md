@@ -1,31 +1,55 @@
-# xray-argo无交互一键四协议安装脚本
-最好用的一键xray-argo脚本，一键四协议无交互安装脚本！
-* vless-grpc-reality | vless-xhttp-reality | vless-ws-tls(argo) | vmess-ws-tls(argo)
+# Xray-Argo 精简版一键脚本
 
-### 支持系统列表：
->Debian
->Ubuntu
->CentOS
->Alpine
->Fedora
->Alma-linux
->Rocky-linux
->Amazom-linux
+精简高效的 Xray-Argo 一键安装脚本，无交互全自动部署。
 
-***
-* xhttp目前支持的客户端较少，v2rayN或小火箭更新到新版内核才支持
-* 可选环境变量：UUID PORT CFIP CFPORT 自定义变量放脚本前面运行即可
-* NAT小鸡需带PORT变量运行并确保PORT之后的1个端口可用，或运行完后更改订阅端口和reality端口
+## 协议
 
-```
+| 协议 | 说明 |
+|---|---|
+| VLESS + WS + TLS | 通过 Cloudflare Argo 隧道，客户端 TLS 由 CF 边缘终结 |
+| VLESS + WS | 端口 80 明文直连，适用于运营商免流场景 |
+
+## 支持系统
+
+Debian / Ubuntu / CentOS / Alpine / Fedora / AlmaLinux / Rocky Linux / Amazon Linux
+
+## 使用方法
+
+**一键安装（交互菜单）**
+```bash
 bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh)
 ```
 
-带变量运行示例,修改为自己需要定义的参数
-```
-PORT=8888 CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh)
+**带变量运行（无交互，修改为自己的参数）**
+```bash
+UUID=自定义UUID CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh)
 ```
 
-# 免责声明
-* 本程序仅供学习了解, 非盈利目的，请于下载后 24 小时内删除, 不得用作任何商业用途, 文字、数据及图片均有所属版权, 如转载须注明来源。
-* 使用本程序必循遵守部署免责声明，使用本程序必循遵守部署服务器所在地、所在国家和用户所在国家的法律法规, 程序作者不对使用者任何不当行为负责。
+## 可用环境变量
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `UUID` | 节点身份标识 | 随机生成 |
+| `ARGO_PORT` | Xray WS 本地监听端口（cloudflared 回源端口） | `8080` |
+| `CFIP` | Cloudflare 优选 IP | `cdns.doon.eu.org` |
+| `CFPORT` | Cloudflare 优选端口 | `443` |
+
+## 菜单功能
+
+```
+1. 安装 Xray-2go
+2. 卸载 Xray-2go
+3. Argo 隧道管理（启动/停止/固定隧道/临时隧道切换）
+4. 查看节点信息
+5. 修改节点配置（UUID / Argo 端口 / 免流 Path）
+```
+
+## 说明
+
+- Argo 节点 TLS 由 Cloudflare 边缘提供，xray 本地无需配置证书
+- 免流节点依赖运营商免流规则，请自行确认 IP 和端口是否在免流名单内
+- NAT 机器使用免流节点前请确认端口 80 在可用端口范围内
+
+## 免责声明
+
+本程序仅供学习研究使用，非盈利目的，请于下载后 24 小时内删除，不得用作任何商业用途。使用本程序须遵守部署服务器所在地及用户所在国家和地区的相关法律法规，程序作者不对使用者任何不当行为承担责任。
