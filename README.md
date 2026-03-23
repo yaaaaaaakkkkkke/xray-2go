@@ -7,7 +7,7 @@
 | 协议 | 说明 |
 |---|---|
 | VLESS + WS + TLS | 通过 Cloudflare Argo 隧道，客户端 TLS 由 CF 边缘终结 |
-| VLESS + WS | 端口 80 明文直连，适用于运营商免流场景 |
+| VLESS + WS/TCP | 端口 80 明文直连，适用于运营商免流场景 |
 
 ## 支持系统
 
