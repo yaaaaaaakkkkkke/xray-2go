@@ -31,6 +31,16 @@ export CFPORT=${CFPORT:-'443'}
 
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
+# ── 若 config.json 已存在，从中读取实际 ARGO_PORT，覆盖默认值 ──
+# config.json 是唯一可信的端口来源，避免重启脚本后回退到 8080
+if [ -f "${work_dir}/config.json" ]; then
+    _port=$(jq -r '.inbounds[0].port' "${work_dir}/config.json" 2>/dev/null)
+    if echo "$_port" | grep -qE '^[0-9]+$'; then
+        export ARGO_PORT=$_port
+    fi
+    unset _port
+fi
+
 # ── 读取持久化免流模式，校验合法值，非法值回退 none ──────────
 # FREEFLOW_MODE: none | ws | httpupgrade
 _raw_mode=$(cat "${freeflow_conf}" 2>/dev/null)
