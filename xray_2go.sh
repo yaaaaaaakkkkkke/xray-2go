@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ============================================================
-# 精简版 Xray-Argo 一键脚本
+# 精简版 Xray-2go 一键脚本
 # 协议：
-#   必选：VLESS+WS+TLS（Cloudflare Argo 隧道）
-#   可选：VLESS+WS 免流（port 80）| VLESS+HTTPUpgrade 免流（port 80）| 不安装
+#   Argo（可选）：VLESS+WS+TLS（Cloudflare Argo 隧道）
+#   免流（可选）：VLESS+WS 明文（port 80）| VLESS+HTTPUpgrade（port 80）| 不安装
 # ============================================================
 
 # 颜色输出：printf 替代 echo -e，避免依赖 echo 的 -e 扩展行为
@@ -13,7 +13,6 @@ green()  { printf '\033[1;32m%s\033[0m\n' "$1"; }
 yellow() { printf '\033[1;33m%s\033[0m\n' "$1"; }
 purple() { printf '\033[1;35m%s\033[0m\n' "$1"; }
 skyblue(){ printf '\033[1;36m%s\033[0m\n' "$1"; }
-# reading：printf 输出提示（无末尾换行），read -r 读取输入
 reading() { printf '\033[1;91m%s\033[0m' "$1"; read -r "$2"; }
 
 # ── 常量 ────────────────────────────────────────────────────
@@ -22,6 +21,7 @@ work_dir="/etc/xray"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 freeflow_conf="${work_dir}/freeflow.conf"
+argo_mode_conf="${work_dir}/argo_mode.conf"
 
 # ── 环境变量（可外部注入） ───────────────────────────────────
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
@@ -31,10 +31,20 @@ export CFPORT=${CFPORT:-'443'}
 
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
-# ── 若 config.json 已存在，从中读取实际 ARGO_PORT，覆盖默认值 ──
-# config.json 是唯一可信的端口来源，避免重启脚本后回退到 8080
-if [ -f "${work_dir}/config.json" ]; then
-    _port=$(jq -r '.inbounds[0].port' "${work_dir}/config.json" 2>/dev/null)
+# ── 读取持久化 Argo 模式，校验合法值，非法值回退 yes ─────────
+# ARGO_MODE: yes=安装 Argo  no=不安装 Argo
+_raw=$(cat "${argo_mode_conf}" 2>/dev/null)
+case "${_raw}" in
+    yes|no) ARGO_MODE="${_raw}" ;;
+    *)      ARGO_MODE="yes"     ;;
+esac
+unset _raw
+
+# ── 若已安装，从 config.json 读取实际 ARGO_PORT ──────────────
+# 仅在 ARGO_MODE=yes 时 inbounds[0] 才是 Argo inbound
+# ARGO_MODE=no 时 inbounds[0] 是免流 inbound（port 80），不应覆盖 ARGO_PORT
+if [ "${ARGO_MODE}" = "yes" ] && [ -f "${config_dir}" ]; then
+    _port=$(jq -r '.inbounds[0].port' "${config_dir}" 2>/dev/null)
     if echo "$_port" | grep -qE '^[0-9]+$'; then
         export ARGO_PORT=$_port
     fi
@@ -43,12 +53,12 @@ fi
 
 # ── 读取持久化免流模式，校验合法值，非法值回退 none ──────────
 # FREEFLOW_MODE: none | ws | httpupgrade
-_raw_mode=$(cat "${freeflow_conf}" 2>/dev/null)
-case "${_raw_mode}" in
-    ws|httpupgrade) FREEFLOW_MODE="${_raw_mode}" ;;
-    *)      FREEFLOW_MODE="none"         ;;
+_raw=$(cat "${freeflow_conf}" 2>/dev/null)
+case "${_raw}" in
+    ws|httpupgrade) FREEFLOW_MODE="${_raw}" ;;
+    *)              FREEFLOW_MODE="none"    ;;
 esac
-unset _raw_mode
+unset _raw
 
 # ============================================================
 # check_xray / check_argo
@@ -74,6 +84,10 @@ check_xray() {
 }
 
 check_argo() {
+    # ARGO_MODE=no 时 Argo 未安装，直接返回特殊状态 3（已知不安装）
+    if [ "${ARGO_MODE}" = "no" ]; then
+        echo "disabled"; return 3
+    fi
     if [ ! -f "${work_dir}/argo" ]; then
         echo "not installed"; return 2
     fi
@@ -100,30 +114,22 @@ manage_packages() {
     [ "$#" -lt 2 ] && red "未指定包名或操作" && return 1
     local action=$1; shift
     [ "$action" != "install" ] && red "未知操作: $action" && return 1
-    local pm
-    if   command -v apt > /dev/null 2>&1; then pm="apt"
-    elif command -v dnf > /dev/null 2>&1; then pm="dnf"
-    elif command -v yum > /dev/null 2>&1; then pm="yum"
-    elif command -v apk > /dev/null 2>&1; then pm="apk"
-    else red "未知系统！"; return 1; fi
     for package in "$@"; do
         if command -v "$package" > /dev/null 2>&1; then
             green "${package} already installed"; continue
         fi
         yellow "正在安装 ${package}..."
-        case "$pm" in
-            apt) DEBIAN_FRONTEND=noninteractive apt install -y "$package" ;;
-            dnf) dnf install -y "$package" ;;
-            yum) yum install -y "$package" ;;
-            apk) apk update && apk add "$package" ;;
-        esac
+        if   command -v apt > /dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+        elif command -v dnf > /dev/null 2>&1; then dnf install -y "$package"
+        elif command -v yum > /dev/null 2>&1; then yum install -y "$package"
+        elif command -v apk > /dev/null 2>&1; then apk update && apk add "$package"
+        else red "未知系统！"; return 1; fi
     done
 }
 
 # ============================================================
 # get_realip
 # 优先 IPv4；若归属 CF/特定 CDN 则切换 IPv6
-# 任一 IP 获取失败时回退，两者均失败则返回空字符串
 # ============================================================
 get_realip() {
     local ip ipv6
@@ -144,10 +150,36 @@ get_realip() {
 # ============================================================
 # get_current_uuid
 # 从 config.json 读取当前实际 UUID，作为统一入口
-# 所有生成链接的函数均通过此函数读取，避免全局变量与文件不同步
 # ============================================================
 get_current_uuid() {
     jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}"
+}
+
+# ============================================================
+# ask_argo_mode
+# 交互选择是否安装 Argo，写入 ARGO_MODE 并持久化
+# ============================================================
+ask_argo_mode() {
+    echo ""
+    green  "是否安装 Cloudflare Argo 隧道？"
+    skyblue "------------------------------------"
+    green  "1. 安装 Argo（VLESS+WS+TLS，默认）"
+    green  "2. 不安装 Argo（仅免流节点）"
+    skyblue "------------------------------------"
+    reading "请输入选择(1-2，回车默认1): " argo_choice
+
+    case "${argo_choice}" in
+        2) ARGO_MODE="no"  ;;
+        *) ARGO_MODE="yes" ;;
+    esac
+    mkdir -p "${work_dir}"
+    echo "${ARGO_MODE}" > "${argo_mode_conf}"
+
+    case "${ARGO_MODE}" in
+        yes) green  "已选择：安装 Argo" ;;
+        no)  yellow "已选择：不安装 Argo（仅免流节点）" ;;
+    esac
+    echo ""
 }
 
 # ============================================================
@@ -165,17 +197,17 @@ ask_freeflow_mode() {
     reading "请输入选择(1-3，回车默认3): " ff_choice
 
     case "${ff_choice}" in
-        1) FREEFLOW_MODE="ws"   ;;
+        1) FREEFLOW_MODE="ws"          ;;
         2) FREEFLOW_MODE="httpupgrade" ;;
-        *) FREEFLOW_MODE="none" ;;
+        *) FREEFLOW_MODE="none"        ;;
     esac
     mkdir -p "${work_dir}"
     echo "${FREEFLOW_MODE}" > "${freeflow_conf}"
 
     case "${FREEFLOW_MODE}" in
-        ws)   green  "已选择：VLESS+WS 免流"  ;;
+        ws)          green  "已选择：VLESS+WS 免流"          ;;
         httpupgrade) green  "已选择：VLESS+HTTPUpgrade 免流" ;;
-        none) yellow "不安装免流节点"          ;;
+        none)        yellow "不安装免流节点"                  ;;
     esac
     echo ""
 }
@@ -215,36 +247,61 @@ EOF
 
 # ============================================================
 # apply_freeflow_config
-# 根据 FREEFLOW_MODE 用 jq 修改 config.json 的 inbounds[1]
-# UUID 从 config.json 读取，与文件始终一致
+# 根据 FREEFLOW_MODE 用 jq 修改 config.json
+# ARGO_MODE=yes：inbounds[0]=Argo，免流追加/替换 inbounds[1]
+# ARGO_MODE=no ：inbounds[0] 就是免流节点，直接替换整个 inbounds
 # ============================================================
 apply_freeflow_config() {
     local cur_uuid ff_json
-    cur_uuid=$(get_current_uuid)
+
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        cur_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}")
+    else
+        # 无 Argo inbound，UUID 从全局变量取（config 初始化时由 UUID 写入）
+        cur_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}" 2>/dev/null)
+        [ -z "$cur_uuid" ] || [ "$cur_uuid" = "null" ] && cur_uuid="${UUID}"
+    fi
 
     case "${FREEFLOW_MODE}" in
         ws|httpupgrade)
             ff_json=$(get_freeflow_inbound_json "${cur_uuid}")
-            jq --argjson ib "${ff_json}" '
-                if (.inbounds | length) == 1
-                then .inbounds += [$ib]
-                else .inbounds[1] = $ib
-                end
-            ' "${config_dir}" > "${config_dir}.tmp" \
-                && mv "${config_dir}.tmp" "${config_dir}"
+            if [ "${ARGO_MODE}" = "yes" ]; then
+                # Argo 模式：免流为 inbounds[1]
+                jq --argjson ib "${ff_json}" '
+                    if (.inbounds | length) == 1
+                    then .inbounds += [$ib]
+                    else .inbounds[1] = $ib
+                    end
+                ' "${config_dir}" > "${config_dir}.tmp" \
+                    && mv "${config_dir}.tmp" "${config_dir}"
+            else
+                # 无 Argo 模式：免流为唯一 inbound，替换 inbounds[0]
+                jq --argjson ib "${ff_json}" '.inbounds = [$ib]' \
+                    "${config_dir}" > "${config_dir}.tmp" \
+                    && mv "${config_dir}.tmp" "${config_dir}"
+            fi
             ;;
         none)
-            jq 'if (.inbounds | length) > 1 then .inbounds = [.inbounds[0]] else . end' \
-                "${config_dir}" > "${config_dir}.tmp" \
-                && mv "${config_dir}.tmp" "${config_dir}"
+            if [ "${ARGO_MODE}" = "yes" ]; then
+                # 删除 inbounds[1]（若存在）
+                jq 'if (.inbounds | length) > 1 then .inbounds = [.inbounds[0]] else . end' \
+                    "${config_dir}" > "${config_dir}.tmp" \
+                    && mv "${config_dir}.tmp" "${config_dir}"
+            else
+                # 无 Argo + 无免流：清空 inbounds（xray 不启动任何监听，合理提示）
+                jq '.inbounds = []' "${config_dir}" > "${config_dir}.tmp" \
+                    && mv "${config_dir}.tmp" "${config_dir}"
+            fi
             ;;
     esac
 }
 
 # ============================================================
 # install_xray
-# 下载 xray + cloudflared，写入基础 config.json（仅 Argo inbound）
-# 再调用 apply_freeflow_config 追加免流 inbound（复用 jq 逻辑）
+# 下载 xray（+ cloudflared 当 ARGO_MODE=yes），写入 config.json
+#
+# ARGO_MODE=yes：基础 config 含 Argo inbound，再追加免流
+# ARGO_MODE=no ：基础 config 为空 inbounds，由 apply_freeflow_config 写入免流
 # ============================================================
 install_xray() {
     clear
@@ -267,20 +324,27 @@ install_xray() {
         "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip" \
         || { red "xray 下载失败，请检查网络"; exit 1; }
 
-    curl -sLo "${work_dir}/argo" \
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" \
-        || { red "cloudflared 下载失败，请检查网络"; exit 1; }
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        curl -sLo "${work_dir}/argo" \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" \
+            || { red "cloudflared 下载失败，请检查网络"; exit 1; }
+    fi
 
     unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 \
         || { red "xray 解压失败"; exit 1; }
 
-    chmod +x "${work_dir}/${server_name}" "${work_dir}/argo"
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        chmod +x "${work_dir}/${server_name}" "${work_dir}/argo"
+    else
+        chmod +x "${work_dir}/${server_name}"
+    fi
     rm -rf "${work_dir}/${server_name}.zip" \
            "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" \
            "${work_dir}/README.md"   "${work_dir}/LICENSE"
 
-    # 基础 config：仅 Argo inbound，合法完整 JSON，无字符串拼接
-    cat > "${config_dir}" << EOF
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        # 基础 config：Argo inbound
+        cat > "${config_dir}" << EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
   "inbounds": [
@@ -304,14 +368,28 @@ install_xray() {
   ]
 }
 EOF
+    else
+        # 基础 config：空 inbounds，由 apply_freeflow_config 填充
+        cat > "${config_dir}" << EOF
+{
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "inbounds": [],
+  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}
+EOF
+    fi
 
     apply_freeflow_config
 }
 
 # ============================================================
 # main_systemd_services
-# 写入 systemd 服务文件并启动（Debian / Ubuntu / CentOS）
-# stdout + stderr 均写入 argo.log 确保域名日志可解析
+# 写入 systemd 服务文件并启动
+# ARGO_MODE=yes 时同时启动 tunnel.service
 # ============================================================
 main_systemd_services() {
     cat > /etc/systemd/system/xray.service << EOF
@@ -332,7 +410,8 @@ RestartPreventExitStatus=23
 WantedBy=multi-user.target
 EOF
 
-    cat > /etc/systemd/system/tunnel.service << EOF
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        cat > /etc/systemd/system/tunnel.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
 After=network.target
@@ -350,8 +429,8 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
 
-    # CentOS：时间同步 + CA 证书，影响 cloudflared TLS 握手
     if [ -f /etc/centos-release ]; then
         yum install -y chrony
         systemctl start chronyd && systemctl enable chronyd
@@ -360,8 +439,10 @@ EOF
     fi
 
     systemctl daemon-reload
-    systemctl enable xray   && systemctl start xray
-    systemctl enable tunnel && systemctl start tunnel
+    systemctl enable xray && systemctl start xray
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        systemctl enable tunnel && systemctl start tunnel
+    fi
 }
 
 # ============================================================
@@ -378,7 +459,8 @@ command_background=true
 pidfile="/var/run/xray.pid"
 EOF
 
-    cat > /etc/init.d/tunnel << EOF
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        cat > /etc/init.d/tunnel << EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
@@ -386,14 +468,15 @@ command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no
 command_background=true
 pidfile="/var/run/tunnel.pid"
 EOF
+        chmod +x /etc/init.d/tunnel
+        rc-update add tunnel default
+    fi
 
-    chmod +x /etc/init.d/xray /etc/init.d/tunnel
+    chmod +x /etc/init.d/xray
     rc-update add xray default
-    rc-update add tunnel default
 }
 
 # change_hosts（Alpine 专用）
-# 修复 cloudflared ping_group_range 报错和 /etc/hosts DNS 问题
 change_hosts() {
     echo "0 0" > /proc/sys/net/ipv4/ping_group_range
     sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
@@ -402,7 +485,7 @@ change_hosts() {
 
 # ============================================================
 # reset_tunnel_to_temp
-# 只重写 ExecStart（systemd）或 command_args（OpenRC）一行切换回临时隧道
+# 只重写 ExecStart/command_args 一行切换回临时隧道
 # 格式与 manage_argo 选项5的 grep -Fq 匹配字符串保持一致
 # systemd：StandardOutput/StandardError 行保持不变
 # ============================================================
@@ -419,7 +502,6 @@ reset_tunnel_to_temp() {
 # ============================================================
 # restart_xray / restart_argo
 # restart_argo：先删旧 argo.log 再重启，避免解析到过期域名
-# restart_xray：daemon-reload 确保 systemd 读取最新服务文件
 # ============================================================
 restart_xray() {
     if [ -f /etc/alpine-release ]; then rc-service xray restart
@@ -487,37 +569,49 @@ build_freeflow_link() {
 
 # ============================================================
 # get_info
-# 重启 Argo，获取临时域名，生成 url.txt 并打印
+# 生成 url.txt 并打印
 #
-# url.txt 结构：
-#   第1行：Argo 节点（必选，get_quick_tunnel 的 sed 锚定此行）
-#   第2行：免流节点（FREEFLOW_MODE != none 时存在）
+# ARGO_MODE=yes：
+#   重启 Argo，获取临时域名
+#   url.txt 第1行：Argo 节点（get_quick_tunnel 的 sed 锚定此行）
+#   url.txt 第2行：免流节点（FREEFLOW_MODE != none 时）
+#
+# ARGO_MODE=no：
+#   不涉及 Argo，直接写免流节点
+#   url.txt 只有免流节点（若 FREEFLOW_MODE=none 则文件为空）
 # ============================================================
 get_info() {
     clear
-    local IP argodomain cur_uuid
+    local IP
     IP=$(get_realip)
-    cur_uuid=$(get_current_uuid)
 
-    purple "正在获取 ArgoDomain，请稍等..."
-    restart_argo
-    argodomain=$(get_argodomain)
-
-    if [ -z "$argodomain" ]; then
-        yellow "未能获取 ArgoDomain，Argo 节点链接暂时无效，可稍后通过 Argo 管理菜单重新获取"
-        argodomain="<未获取到域名>"
-    else
-        green "ArgoDomain：${argodomain}"
-    fi
     if [ -z "$IP" ]; then
         yellow "警告：无法获取服务器 IP，免流节点链接将缺失"
     fi
-    echo ""
 
-    {
-        echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
-        [ -n "$IP" ] && build_freeflow_link "${IP}"
-    } > "${client_dir}"
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        local cur_uuid argodomain
+        cur_uuid=$(get_current_uuid)
+        purple "正在获取 ArgoDomain，请稍等..."
+        restart_argo
+        argodomain=$(get_argodomain)
+        if [ -z "$argodomain" ]; then
+            yellow "未能获取 ArgoDomain，Argo 节点链接暂时无效，可稍后通过 Argo 管理菜单重新获取"
+            argodomain="<未获取到域名>"
+        else
+            green "ArgoDomain：${argodomain}"
+        fi
+        echo ""
+        {
+            echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
+            [ -n "$IP" ] && build_freeflow_link "${IP}"
+        } > "${client_dir}"
+    else
+        echo ""
+        {
+            [ -n "$IP" ] && build_freeflow_link "${IP}"
+        } > "${client_dir}"
+    fi
 
     print_nodes
 }
@@ -525,9 +619,12 @@ get_info() {
 # ============================================================
 # get_quick_tunnel
 # 重启 Argo，提取新临时域名，更新 url.txt 第1行的 sni/host
-# 第1行结构固定为 Argo 节点，sed 行号锚定安全
+# 仅在 ARGO_MODE=yes 时可用；第1行固定为 Argo 节点
 # ============================================================
 get_quick_tunnel() {
+    if [ "${ARGO_MODE}" != "yes" ]; then
+        yellow "未安装 Argo，此操作不可用"; return 1
+    fi
     if [ ! -f "${client_dir}" ]; then
         yellow "节点文件不存在，请先执行安装以初始化节点信息"
         return 1
@@ -550,8 +647,12 @@ get_quick_tunnel() {
 
 # ============================================================
 # manage_argo - Argo 隧道管理
+# ARGO_MODE=no 时直接提示不可用
 # ============================================================
 manage_argo() {
+    if [ "${ARGO_MODE}" != "yes" ]; then
+        yellow "未安装 Argo，Argo 管理不可用"; sleep 1; menu; return
+    fi
     local cx
     check_argo > /dev/null 2>&1; cx=$?
     if [ "$cx" -eq 2 ]; then
@@ -585,9 +686,6 @@ manage_argo() {
                 red "Argo 域名不能为空"; return
             fi
             reading "请输入 Argo 密钥（token 或 json）: " argo_auth
-            if [ -z "$argo_auth" ]; then
-                red "Argo 密钥不能为空"; return
-            fi
 
             if echo "$argo_auth" | grep -q "TunnelSecret"; then
                 local tunnel_id
@@ -665,17 +763,19 @@ EOF
 change_config() {
     local ff_label
     case "${FREEFLOW_MODE}" in
-        ws)   ff_label="VLESS+WS（当前）"  ;;
+        ws)          ff_label="VLESS+WS（当前）"          ;;
         httpupgrade) ff_label="VLESS+HTTPUpgrade（当前）" ;;
-        none) ff_label="未安装（当前）"    ;;
-        *)    ff_label="未知"              ;;
+        none)        ff_label="未安装（当前）"             ;;
+        *)           ff_label="未知"                      ;;
     esac
 
     clear; echo ""
     green  "1. 修改 UUID"
     skyblue "------------"
-    green  "2. 修改 Argo 回源端口（当前：${ARGO_PORT}）"
-    skyblue "-------------------------------------------"
+    if [ "${ARGO_MODE}" = "yes" ]; then
+        green  "2. 修改 Argo 回源端口（当前：${ARGO_PORT}）"
+        skyblue "-------------------------------------------"
+    fi
     green  "3. 变更免流方式（${ff_label}）"
     skyblue "--------------------------------"
     purple "0. 返回主菜单"
@@ -697,6 +797,9 @@ change_config() {
             print_nodes
             ;;
         2)
+            if [ "${ARGO_MODE}" != "yes" ]; then
+                red "无效的选项！"; return
+            fi
             reading "请输入新的 Argo 回源端口（回车随机）: " new_port
             if [ -z "$new_port" ]; then
                 new_port=$(shuf -i 2000-65000 -n 1)
@@ -729,12 +832,18 @@ change_config() {
             fi
             apply_freeflow_config
             local argo_line ip_now
-            argo_line=$(head -1 "${client_dir}")
             ip_now=$(get_realip)
-            {
-                echo "${argo_line}"
-                [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
-            } > "${client_dir}"
+            if [ "${ARGO_MODE}" = "yes" ]; then
+                argo_line=$(head -1 "${client_dir}")
+                {
+                    echo "${argo_line}"
+                    [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
+                } > "${client_dir}"
+            else
+                {
+                    [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
+                } > "${client_dir}"
+            fi
             restart_xray
             green "免流方式已变更"
             print_nodes
@@ -760,7 +869,7 @@ check_nodes() {
 
 # ============================================================
 # uninstall_xray - 停止服务，删除服务文件和工作目录
-# 顺序：stop → 注销自启 → 删文件
+# ARGO_MODE=yes 时同时停止并删除 tunnel 服务
 # ============================================================
 uninstall_xray() {
     reading "确定要卸载 xray-2go 吗？(y/n): " choice
@@ -769,15 +878,22 @@ uninstall_xray() {
             yellow "正在卸载..."
             if [ -f /etc/alpine-release ]; then
                 rc-service xray stop   2>/dev/null
-                rc-service tunnel stop 2>/dev/null
-                rc-update del xray default   2>/dev/null
-                rc-update del tunnel default 2>/dev/null
-                rm -f /etc/init.d/xray /etc/init.d/tunnel
+                rc-update del xray default 2>/dev/null
+                rm -f /etc/init.d/xray
+                if [ "${ARGO_MODE}" = "yes" ]; then
+                    rc-service tunnel stop 2>/dev/null
+                    rc-update del tunnel default 2>/dev/null
+                    rm -f /etc/init.d/tunnel
+                fi
             else
-                systemctl stop xray tunnel 2>/dev/null
-                systemctl disable xray tunnel 2>/dev/null
-                rm -f /etc/systemd/system/xray.service \
-                      /etc/systemd/system/tunnel.service
+                systemctl stop xray 2>/dev/null
+                systemctl disable xray 2>/dev/null
+                rm -f /etc/systemd/system/xray.service
+                if [ "${ARGO_MODE}" = "yes" ]; then
+                    systemctl stop tunnel 2>/dev/null
+                    systemctl disable tunnel 2>/dev/null
+                    rm -f /etc/systemd/system/tunnel.service
+                fi
                 systemctl daemon-reload
             fi
             rm -rf "${work_dir}"
@@ -794,22 +910,27 @@ trap 'red "已取消操作"; exit' INT
 # ============================================================
 menu() {
     while true; do
-        local xray_status argo_status cx ff_display
+        local xray_status argo_status cx ff_display argo_display
         xray_status=$(check_xray); cx=$?
         argo_status=$(check_argo)
         case "${FREEFLOW_MODE}" in
-            ws)   ff_display="WS"   ;;
+            ws)          ff_display="WS"          ;;
             httpupgrade) ff_display="HTTPUpgrade" ;;
-            none) ff_display="无"   ;;
-            *)    ff_display="未知" ;;
+            none)        ff_display="无"          ;;
+            *)           ff_display="未知"        ;;
         esac
+        if [ "${ARGO_MODE}" = "yes" ]; then
+            argo_display="${argo_status}"
+        else
+            argo_display="未启用"
+        fi
 
         clear; echo ""
-        purple "=== Xray-2go 精简版（VLESS+WS）==="
+        purple "=== Xray-2go 精简版 ==="
         purple " Xray 状态: ${xray_status}"
-        purple " Argo 状态: ${argo_status}"
+        purple " Argo 状态: ${argo_display}"
         purple " 免流模式:  ${ff_display}"
-        echo   "=================================="
+        echo   "========================"
         green  "1. 安装 Xray-2go"
         red    "2. 卸载 Xray-2go"
         echo   "================="
@@ -828,6 +949,7 @@ menu() {
                 if [ "$cx" -eq 0 ]; then
                     yellow "Xray-2go 已安装！"
                 else
+                    ask_argo_mode
                     ask_freeflow_mode
                     manage_packages install jq unzip
                     install_xray
@@ -837,7 +959,7 @@ menu() {
                         alpine_openrc_services
                         change_hosts
                         rc-service xray restart
-                        rc-service tunnel restart
+                        [ "${ARGO_MODE}" = "yes" ] && rc-service tunnel restart
                     else
                         red "不支持的 init 系统"; exit 1
                     fi
