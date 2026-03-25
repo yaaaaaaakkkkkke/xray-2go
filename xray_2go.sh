@@ -202,15 +202,28 @@ get_current_uuid() {
 
 # ============================================================
 # install_shortcut
-# 在 /usr/local/bin/s 安装快捷方式（不区分大小写，统一小写 s）
+# 将脚本本体复制到 /usr/local/bin/xray2go（固定路径），
+# 再创建 /usr/local/bin/s 指向它。
+# 兼容 bash <(curl ...) / pipe 执行场景：此时 $0 为临时 fd 路径，
+# 通过 /proc/self/fd/255 读取当前 bash 进程加载的脚本内容。
 # ============================================================
 install_shortcut() {
-    local script_path
-    script_path=$(readlink -f "$0")
-    cat > "${shortcut_path}" << EOF
-#!/bin/bash
-bash "${script_path}" "\$@"
-EOF
+    local script_main="/usr/local/bin/xray2go"
+
+    # 优先：$0 是真实文件（直接执行 bash argo.sh）
+    if [ -f "$0" ]; then
+        cp -f "$0" "${script_main}"
+    # 次选：bash <(curl ...) 场景，fd/255 指向脚本内容
+    elif [ -r /proc/self/fd/255 ]; then
+        cat /proc/self/fd/255 > "${script_main}"
+    else
+        yellow "无法确定脚本路径，快捷方式安装跳过"; return 1
+    fi
+
+    chmod +x "${script_main}"
+
+    # s → xray2go
+    printf '#!/bin/bash\nexec /usr/local/bin/xray2go "$@"\n' > "${shortcut_path}"
     chmod +x "${shortcut_path}"
     green "快捷方式已安装：输入 s 可直接启动本脚本"
 }
@@ -1374,7 +1387,7 @@ uninstall_xray() {
                 systemctl daemon-reload
             fi
             rm -rf "${work_dir}"
-            rm -f "${shortcut_path}"
+            rm -f "${shortcut_path}" /usr/local/bin/xray2go
             green "Xray-2go 卸载完成"
             ;;
         *) purple "已取消卸载" ;;
