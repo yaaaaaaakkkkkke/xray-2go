@@ -215,26 +215,22 @@ get_current_uuid() {
 install_shortcut() {
     local script_main="/usr/local/bin/xray2go"
 
-    # 优先使用真实路径
-    local src
-    src="$(readlink -f "$0" 2>/dev/null)"
-
-    if [ -f "$src" ]; then
-        cp -f "$src" "$script_main"
+    # 优先：$0 是真实文件（直接执行 bash argo.sh）
+    if [ -f "$0" ]; then
+        cp -f "$0" "${script_main}"
+    # 次选：bash <(curl ...) 场景，fd/255 指向脚本内容
+    elif [ -r /proc/self/fd/255 ]; then
+        cat /proc/self/fd/255 > "${script_main}"
     else
-        yellow "请使用 bash argo.sh 方式运行以安装快捷方式"
-        return 1
+        yellow "无法确定脚本路径，快捷方式安装跳过"; return 1
     fi
 
-    chmod +x "$script_main"
+    chmod +x "${script_main}"
 
-    cat > /usr/local/bin/s << 'EOF'
-#!/bin/bash
-exec /usr/local/bin/xray2go "$@"
-EOF
-
-    chmod +x /usr/local/bin/s
-    green "快捷方式已安装：s"
+    # s → xray2go
+    printf '#!/bin/bash\nexec /usr/local/bin/xray2go "$@"\n' > "${shortcut_path}"
+    chmod +x "${shortcut_path}"
+    green "快捷方式已安装：输入 s 可直接启动本脚本"
 }
 
 # ============================================================
