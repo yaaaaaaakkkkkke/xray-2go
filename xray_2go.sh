@@ -1474,8 +1474,8 @@ menu() {
                     else
                         red "不支持的 init 系统"; exit 1
                     fi
-                    install_shortcut
                     get_info
+                    install_shortcut
                 fi
                 ;;
             2) uninstall_xray ;;
