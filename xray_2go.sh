@@ -4,7 +4,9 @@
 # 精简版 Xray-2go 一键脚本
 # 协议：
 #   Argo（可选）：VLESS+WS+TLS（Cloudflare Argo 隧道）
+#   Reality（可选）：VLESS+TCP+TLS（VLESS Reality）
 #   免流（可选）：VLESS+WS 明文（port 80）| VLESS+HTTPUpgrade（port 80）| 不安装
+#   Shadowsocks（可选）：SS+TCP/UDP
 # ============================================================
 
 # 颜色输出：printf 替代 echo -e，避免依赖 echo 的 -e 扩展行为
@@ -22,6 +24,10 @@ config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 freeflow_conf="${work_dir}/freeflow.conf"
 argo_mode_conf="${work_dir}/argo_mode.conf"
+reality_mode_conf="${work_dir}/reality_mode.conf"
+reality_conf="${work_dir}/reality.conf"
+ss_conf="${work_dir}/ss.conf"
+shortcut_path="/usr/local/bin/s"
 
 # ── 环境变量（可外部注入） ───────────────────────────────────
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
@@ -31,8 +37,7 @@ export CFPORT=${CFPORT:-'443'}
 
 [ "$EUID" -ne 0 ] && red "请在 root 用户下运行脚本" && exit 1
 
-# ── 读取持久化 Argo 模式，校验合法值，非法值回退 yes ─────────
-# ARGO_MODE: yes=安装 Argo  no=不安装 Argo
+# ── 读取持久化 Argo 模式 ──────────────────────────────────────
 _raw=$(cat "${argo_mode_conf}" 2>/dev/null)
 case "${_raw}" in
     yes|no) ARGO_MODE="${_raw}" ;;
@@ -41,8 +46,6 @@ esac
 unset _raw
 
 # ── 若已安装，从 config.json 读取实际 ARGO_PORT ──────────────
-# 仅在 ARGO_MODE=yes 时 inbounds[0] 才是 Argo inbound
-# ARGO_MODE=no 时 inbounds[0] 是免流 inbound（port 80），不应覆盖 ARGO_PORT
 if [ "${ARGO_MODE}" = "yes" ] && [ -f "${config_dir}" ]; then
     _port=$(jq -r '.inbounds[0].port' "${config_dir}" 2>/dev/null)
     if echo "$_port" | grep -qE '^[0-9]+$'; then
@@ -51,14 +54,57 @@ if [ "${ARGO_MODE}" = "yes" ] && [ -f "${config_dir}" ]; then
     unset _port
 fi
 
-# ── 读取持久化免流模式，校验合法值，非法值回退 none ──────────
-# FREEFLOW_MODE: none | ws | httpupgrade
-_raw=$(cat "${freeflow_conf}" 2>/dev/null)
+# ── 读取持久化免流配置（line1=mode, line2=path） ─────────────
+# FREEFLOW_MODE: none | ws | httpupgrade   FF_PATH: URL path
+FF_PATH="/"
+if [ -f "${freeflow_conf}" ]; then
+    _l1=$(sed -n '1p' "${freeflow_conf}" 2>/dev/null)
+    _l2=$(sed -n '2p' "${freeflow_conf}" 2>/dev/null)
+    case "${_l1}" in
+        ws|httpupgrade) FREEFLOW_MODE="${_l1}" ;;
+        *)              FREEFLOW_MODE="none"   ;;
+    esac
+    [ -n "${_l2}" ] && FF_PATH="${_l2}"
+    unset _l1 _l2
+else
+    FREEFLOW_MODE="none"
+fi
+
+# ── 读取持久化 Reality 模式 ───────────────────────────────────
+_raw=$(cat "${reality_mode_conf}" 2>/dev/null)
 case "${_raw}" in
-    ws|httpupgrade) FREEFLOW_MODE="${_raw}" ;;
-    *)              FREEFLOW_MODE="none"    ;;
+    yes|no) REALITY_MODE="${_raw}" ;;
+    *)      REALITY_MODE="no"      ;;
 esac
 unset _raw
+
+# ── 读取持久化 Reality 参数（SNI / PORT） ────────────────────
+REALITY_SNI="www.cloudflare.com"
+REALITY_PORT="443"
+if [ -f "${reality_conf}" ]; then
+    _sni=$(sed -n '1p' "${reality_conf}" 2>/dev/null)
+    _rp=$(sed -n  '2p' "${reality_conf}" 2>/dev/null)
+    [ -n "${_sni}" ] && REALITY_SNI="${_sni}"
+    echo "${_rp}" | grep -qE '^[0-9]+$' && REALITY_PORT="${_rp}"
+    unset _sni _rp
+fi
+
+# ── 读取持久化 Shadowsocks 配置（line1=mode, line2=port, line3=password, line4=method） ──
+SS_MODE="no"
+SS_PORT="8388"
+SS_PASSWORD=""
+SS_METHOD="aes-256-gcm"
+if [ -f "${ss_conf}" ]; then
+    _s1=$(sed -n '1p' "${ss_conf}" 2>/dev/null)
+    _s2=$(sed -n '2p' "${ss_conf}" 2>/dev/null)
+    _s3=$(sed -n '3p' "${ss_conf}" 2>/dev/null)
+    _s4=$(sed -n '4p' "${ss_conf}" 2>/dev/null)
+    case "${_s1}" in yes|no) SS_MODE="${_s1}" ;; esac
+    echo "${_s2}" | grep -qE '^[0-9]+$' && SS_PORT="${_s2}"
+    [ -n "${_s3}" ] && SS_PASSWORD="${_s3}"
+    [ -n "${_s4}" ] && SS_METHOD="${_s4}"
+    unset _s1 _s2 _s3 _s4
+fi
 
 # ============================================================
 # check_xray / check_argo
@@ -84,7 +130,6 @@ check_xray() {
 }
 
 check_argo() {
-    # ARGO_MODE=no 时 Argo 未安装，直接返回特殊状态 3（已知不安装）
     if [ "${ARGO_MODE}" = "no" ]; then
         echo "disabled"; return 3
     fi
@@ -156,15 +201,47 @@ get_current_uuid() {
 }
 
 # ============================================================
+# install_shortcut
+# 在 /usr/local/bin/s 安装快捷方式（不区分大小写，统一小写 s）
+# ============================================================
+install_shortcut() {
+    local script_path
+    script_path=$(readlink -f "$0")
+    cat > "${shortcut_path}" << EOF
+#!/bin/bash
+bash "${script_path}" "\$@"
+EOF
+    chmod +x "${shortcut_path}"
+    green "快捷方式已安装：输入 s 可直接启动本脚本"
+}
+
+# ============================================================
+# _save_freeflow_conf
+# 将 FREEFLOW_MODE 和 FF_PATH 持久化（两行格式）
+# ============================================================
+_save_freeflow_conf() {
+    mkdir -p "${work_dir}"
+    printf '%s\n%s\n' "${FREEFLOW_MODE}" "${FF_PATH}" > "${freeflow_conf}"
+}
+
+# ============================================================
+# _save_ss_conf
+# 将 SS 参数持久化（四行格式）
+# ============================================================
+_save_ss_conf() {
+    mkdir -p "${work_dir}"
+    printf '%s\n%s\n%s\n%s\n' "${SS_MODE}" "${SS_PORT}" "${SS_PASSWORD}" "${SS_METHOD}" > "${ss_conf}"
+}
+
+# ============================================================
 # ask_argo_mode
-# 交互选择是否安装 Argo，写入 ARGO_MODE 并持久化
 # ============================================================
 ask_argo_mode() {
     echo ""
     green  "是否安装 Cloudflare Argo 隧道？"
     skyblue "------------------------------------"
     green  "1. 安装 Argo（VLESS+WS+TLS，默认）"
-    green  "2. 不安装 Argo（仅免流节点）"
+    green  "2. 不安装 Argo（仅免流/Reality/SS 节点）"
     skyblue "------------------------------------"
     reading "请输入选择(1-2，回车默认1): " argo_choice
 
@@ -177,14 +254,51 @@ ask_argo_mode() {
 
     case "${ARGO_MODE}" in
         yes) green  "已选择：安装 Argo" ;;
-        no)  yellow "已选择：不安装 Argo（仅免流节点）" ;;
+        no)  yellow "已选择：不安装 Argo" ;;
     esac
     echo ""
 }
 
 # ============================================================
+# ask_reality_mode
+# ============================================================
+ask_reality_mode() {
+    echo ""
+    green  "是否安装 VLESS Reality 节点？"
+    skyblue "----------------------------------------"
+    green  "1. 安装 Reality（VLESS+TCP+TLS）"
+    green  "2. 不安装 Reality（默认）"
+    skyblue "----------------------------------------"
+    reading "请输入选择(1-2，回车默认2): " reality_choice
+
+    case "${reality_choice}" in
+        1) REALITY_MODE="yes" ;;
+        *) REALITY_MODE="no"  ;;
+    esac
+    mkdir -p "${work_dir}"
+    echo "${REALITY_MODE}" > "${reality_mode_conf}"
+
+    if [ "${REALITY_MODE}" = "yes" ]; then
+        reading "请输入 Reality SNI（回车默认 www.cloudflare.com）: " r_sni
+        reading "请输入 Reality 监听端口（回车默认 443）: " r_port
+        [ -z "${r_sni}" ] && r_sni="www.cloudflare.com"
+        if ! echo "${r_port}" | grep -qE '^[0-9]+$' || \
+           [ "${r_port}" -lt 1 ] 2>/dev/null || [ "${r_port}" -gt 65535 ] 2>/dev/null; then
+            r_port="443"
+        fi
+        REALITY_SNI="${r_sni}"
+        REALITY_PORT="${r_port}"
+        printf '%s\n%s\n' "${REALITY_SNI}" "${REALITY_PORT}" > "${reality_conf}"
+        green "已选择：安装 Reality（SNI=${REALITY_SNI}，Port=${REALITY_PORT}）"
+    else
+        yellow "已选择：不安装 Reality"
+    fi
+    echo ""
+}
+
+# ============================================================
 # ask_freeflow_mode
-# 交互选择免流方式，写入 FREEFLOW_MODE 并持久化
+# 交互选择免流协议和 path，持久化 FREEFLOW_MODE + FF_PATH
 # ============================================================
 ask_freeflow_mode() {
     echo ""
@@ -201,23 +315,88 @@ ask_freeflow_mode() {
         2) FREEFLOW_MODE="httpupgrade" ;;
         *) FREEFLOW_MODE="none"        ;;
     esac
-    mkdir -p "${work_dir}"
-    echo "${FREEFLOW_MODE}" > "${freeflow_conf}"
+
+    if [ "${FREEFLOW_MODE}" != "none" ]; then
+        reading "请输入免流 path（回车默认 /）: " ff_path_input
+        if [ -z "${ff_path_input}" ]; then
+            FF_PATH="/"
+        else
+            case "${ff_path_input}" in
+                /*) FF_PATH="${ff_path_input}" ;;
+                *)  FF_PATH="/${ff_path_input}" ;;
+            esac
+        fi
+    else
+        FF_PATH="/"
+    fi
+
+    _save_freeflow_conf
 
     case "${FREEFLOW_MODE}" in
-        ws)          green  "已选择：VLESS+WS 免流"          ;;
-        httpupgrade) green  "已选择：VLESS+HTTPUpgrade 免流" ;;
-        none)        yellow "不安装免流节点"                  ;;
+        ws)          green  "已选择：VLESS+WS 免流（path=${FF_PATH}）"          ;;
+        httpupgrade) green  "已选择：VLESS+HTTPUpgrade 免流（path=${FF_PATH}）" ;;
+        none)        yellow "不安装免流节点"                                     ;;
     esac
     echo ""
 }
 
 # ============================================================
+# ask_ss_mode
+# 交互选择是否安装 Shadowsocks 及参数，持久化到 ss.conf
+# ============================================================
+ask_ss_mode() {
+    echo ""
+    green  "是否安装 Shadowsocks 节点？"
+    skyblue "--------------------------------------------"
+    green  "1. 安装 Shadowsocks（SS+TCP/UDP）"
+    green  "2. 不安装（默认）"
+    skyblue "--------------------------------------------"
+    reading "请输入选择(1-2，回车默认2): " ss_choice
+
+    case "${ss_choice}" in
+        1) SS_MODE="yes" ;;
+        *) SS_MODE="no"  ;;
+    esac
+
+    if [ "${SS_MODE}" = "yes" ]; then
+        reading "请输入 SS 监听端口（回车默认 8388）: " ss_p
+        if ! echo "${ss_p}" | grep -qE '^[0-9]+$' || \
+           [ "${ss_p}" -lt 1 ] 2>/dev/null || [ "${ss_p}" -gt 65535 ] 2>/dev/null; then
+            ss_p="8388"
+        fi
+        reading "请输入 SS 密码（回车自动生成）: " ss_pw
+        [ -z "${ss_pw}" ] && ss_pw=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c1-16)
+
+        echo ""
+        green  "请选择加密方式："
+        skyblue "-----------------------------"
+        green  "1. aes-256-gcm（默认，推荐）"
+        green  "2. aes-128-gcm"
+        green  "3. chacha20-poly1305"
+        green  "4. xchacha20-poly1305"
+        skyblue "-----------------------------"
+        reading "请输入选择(1-4，回车默认1): " ss_m
+        case "${ss_m}" in
+            2) SS_METHOD="aes-128-gcm"       ;;
+            3) SS_METHOD="chacha20-poly1305"  ;;
+            4) SS_METHOD="xchacha20-poly1305" ;;
+            *) SS_METHOD="aes-256-gcm"        ;;
+        esac
+
+        SS_PORT="${ss_p}"
+        SS_PASSWORD="${ss_pw}"
+        _save_ss_conf
+        green "已选择：安装 Shadowsocks（Port=${SS_PORT}，Method=${SS_METHOD}）"
+    else
+        _save_ss_conf
+        yellow "已选择：不安装 Shadowsocks"
+    fi
+    echo ""
+}
+
+# ============================================================
 # get_freeflow_inbound_json <uuid>
-# 根据 FREEFLOW_MODE 输出免流 inbound JSON 字符串
-# VLESS+WS：port 80，path 默认为 /
-# VLESS+HTTPUpgrade：port 80，HTTP Upgrade 握手
-# none：不输出
+# 根据 FREEFLOW_MODE / FF_PATH 输出免流 inbound JSON 字符串
 # ============================================================
 get_freeflow_inbound_json() {
     local uuid="$1"
@@ -227,7 +406,10 @@ get_freeflow_inbound_json() {
 {
   "port": 80, "listen": "::", "protocol": "vless",
   "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
-  "streamSettings": { "network": "ws", "security": "none" },
+  "streamSettings": {
+    "network": "ws", "security": "none",
+    "wsSettings": { "path": "${FF_PATH}" }
+  },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }
 EOF
@@ -237,7 +419,10 @@ EOF
 {
   "port": 80, "listen": "::", "protocol": "vless",
   "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
-  "streamSettings": { "network": "httpupgrade", "security": "none" },
+  "streamSettings": {
+    "network": "httpupgrade", "security": "none",
+    "httpupgradeSettings": { "path": "${FF_PATH}" }
+  },
   "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
 }
 EOF
@@ -246,62 +431,176 @@ EOF
 }
 
 # ============================================================
+# get_reality_inbound_json <uuid> <private_key> <short_id>
+# 输出 Reality inbound JSON 字符串
+# ============================================================
+get_reality_inbound_json() {
+    local uuid="$1" privkey="$2" shortid="$3"
+    cat << EOF
+{
+  "port": ${REALITY_PORT}, "listen": "::", "protocol": "vless",
+  "settings": {
+    "clients": [{ "id": "${uuid}", "flow": "xtls-rprx-vision" }],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "dest": "${REALITY_SNI}:${REALITY_PORT}",
+      "serverNames": ["${REALITY_SNI}"],
+      "privateKey": "${privkey}",
+      "shortIds": ["${shortid}"]
+    }
+  },
+  "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
+}
+EOF
+}
+
+# ============================================================
+# get_ss_inbound_json
+# 输出 Shadowsocks inbound JSON 字符串
+# ============================================================
+get_ss_inbound_json() {
+    cat << EOF
+{
+  "port": ${SS_PORT}, "listen": "::", "protocol": "shadowsocks",
+  "settings": {
+    "method": "${SS_METHOD}",
+    "password": "${SS_PASSWORD}",
+    "network": "tcp,udp"
+  },
+  "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "metadataOnly": false }
+}
+EOF
+}
+
+# ============================================================
+# inbounds 下标计算
+# 布局：[Argo?][Reality?][FreeFlow?][SS?]
+# ============================================================
+calc_reality_index() {
+    if [ "${ARGO_MODE}" = "yes" ]; then echo 1; else echo 0; fi
+}
+
+calc_freeflow_index() {
+    local idx=0
+    [ "${ARGO_MODE}"    = "yes" ] && idx=$(( idx + 1 ))
+    [ "${REALITY_MODE}" = "yes" ] && idx=$(( idx + 1 ))
+    echo $idx
+}
+
+calc_ss_index() {
+    local idx=0
+    [ "${ARGO_MODE}"         = "yes"  ] && idx=$(( idx + 1 ))
+    [ "${REALITY_MODE}"      = "yes"  ] && idx=$(( idx + 1 ))
+    [ "${FREEFLOW_MODE}"    != "none" ] && idx=$(( idx + 1 ))
+    echo $idx
+}
+
+# ============================================================
+# _jq_set_inbound <idx> <json_str>
+# 在 inbounds[$idx] 写入或替换 inbound；数组不足则用空对象填充
+# ============================================================
+_jq_set_inbound() {
+    local idx="$1" ib_json="$2"
+    jq --argjson ib "${ib_json}" --argjson idx "${idx}" '
+        (.inbounds | length) as $len |
+        if $len > $idx then .inbounds[$idx] = $ib
+        else .inbounds = (.inbounds + [range($idx - $len + 1) | {}]) | .inbounds[$idx] = $ib
+        end
+    ' "${config_dir}" > "${config_dir}.tmp" \
+        && mv "${config_dir}.tmp" "${config_dir}"
+}
+
+# ============================================================
+# _jq_del_inbound <idx> <match>
+# 安全删除 inbounds[$idx]：仅当协议/security/network 匹配 match 时才删除
+# ============================================================
+_jq_del_inbound() {
+    local idx="$1" match="$2"
+    jq --argjson idx "${idx}" --arg match "${match}" '
+        if (.inbounds | length) > $idx and
+           ((.inbounds[$idx].streamSettings.security // "") == $match or
+            (.inbounds[$idx].streamSettings.network  // "") == $match or
+            (.inbounds[$idx].protocol                // "") == $match)
+        then .inbounds = (.inbounds[:$idx] + .inbounds[$idx+1:])
+        else .
+        end
+    ' "${config_dir}" > "${config_dir}.tmp" \
+        && mv "${config_dir}.tmp" "${config_dir}"
+}
+
+# ============================================================
+# apply_reality_config
+# ============================================================
+apply_reality_config() {
+    local cur_uuid privkey shortid ri_json
+    cur_uuid=$(get_current_uuid)
+    [ -z "$cur_uuid" ] || [ "$cur_uuid" = "null" ] && cur_uuid="${UUID}"
+
+    case "${REALITY_MODE}" in
+        yes)
+            local keys_file="${work_dir}/reality_keys.conf"
+            if [ ! -f "${keys_file}" ]; then
+                local key_out pubkey_gen
+                key_out=$("${work_dir}/${server_name}" x25519 2>/dev/null)
+                privkey=$(echo "${key_out}"    | grep -i 'Private key' | awk '{print $NF}')
+                pubkey_gen=$(echo "${key_out}" | grep -i 'Public key'  | awk '{print $NF}')
+                shortid=$(openssl rand -hex 8 2>/dev/null || \
+                    cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c1-16)
+                printf '%s\n%s\n%s\n' "${privkey}" "${pubkey_gen}" "${shortid}" > "${keys_file}"
+            else
+                privkey=$(sed -n '1p' "${keys_file}")
+                shortid=$(sed -n '3p' "${keys_file}")
+            fi
+            ri_json=$(get_reality_inbound_json "${cur_uuid}" "${privkey}" "${shortid}")
+            _jq_set_inbound "$(calc_reality_index)" "${ri_json}"
+            ;;
+        no)
+            _jq_del_inbound "$(calc_reality_index)" "reality"
+            ;;
+    esac
+}
+
+# ============================================================
 # apply_freeflow_config
-# 根据 FREEFLOW_MODE 用 jq 修改 config.json
-# ARGO_MODE=yes：inbounds[0]=Argo，免流追加/替换 inbounds[1]
-# ARGO_MODE=no ：inbounds[0] 就是免流节点，直接替换整个 inbounds
 # ============================================================
 apply_freeflow_config() {
     local cur_uuid ff_json
-
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        cur_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}")
-    else
-        # 无 Argo inbound，UUID 从全局变量取（config 初始化时由 UUID 写入）
-        cur_uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "${config_dir}" 2>/dev/null)
-        [ -z "$cur_uuid" ] || [ "$cur_uuid" = "null" ] && cur_uuid="${UUID}"
-    fi
+    cur_uuid=$(get_current_uuid)
+    [ -z "$cur_uuid" ] || [ "$cur_uuid" = "null" ] && cur_uuid="${UUID}"
 
     case "${FREEFLOW_MODE}" in
         ws|httpupgrade)
             ff_json=$(get_freeflow_inbound_json "${cur_uuid}")
-            if [ "${ARGO_MODE}" = "yes" ]; then
-                # Argo 模式：免流为 inbounds[1]
-                jq --argjson ib "${ff_json}" '
-                    if (.inbounds | length) == 1
-                    then .inbounds += [$ib]
-                    else .inbounds[1] = $ib
-                    end
-                ' "${config_dir}" > "${config_dir}.tmp" \
-                    && mv "${config_dir}.tmp" "${config_dir}"
-            else
-                # 无 Argo 模式：免流为唯一 inbound，替换 inbounds[0]
-                jq --argjson ib "${ff_json}" '.inbounds = [$ib]' \
-                    "${config_dir}" > "${config_dir}.tmp" \
-                    && mv "${config_dir}.tmp" "${config_dir}"
-            fi
+            _jq_set_inbound "$(calc_freeflow_index)" "${ff_json}"
             ;;
         none)
-            if [ "${ARGO_MODE}" = "yes" ]; then
-                # 删除 inbounds[1]（若存在）
-                jq 'if (.inbounds | length) > 1 then .inbounds = [.inbounds[0]] else . end' \
-                    "${config_dir}" > "${config_dir}.tmp" \
-                    && mv "${config_dir}.tmp" "${config_dir}"
-            else
-                # 无 Argo + 无免流：清空 inbounds（xray 不启动任何监听，合理提示）
-                jq '.inbounds = []' "${config_dir}" > "${config_dir}.tmp" \
-                    && mv "${config_dir}.tmp" "${config_dir}"
-            fi
+            # 删除时需区分当前实际 network（ws 或 httpupgrade）
+            local cur_net
+            cur_net=$(jq -r --argjson idx "$(calc_freeflow_index)" \
+                '.inbounds[$idx].streamSettings.network // ""' "${config_dir}" 2>/dev/null)
+            _jq_del_inbound "$(calc_freeflow_index)" "${cur_net:-ws}"
             ;;
+    esac
+}
+
+# ============================================================
+# apply_ss_config
+# ============================================================
+apply_ss_config() {
+    case "${SS_MODE}" in
+        yes) _jq_set_inbound "$(calc_ss_index)" "$(get_ss_inbound_json)" ;;
+        no)  _jq_del_inbound "$(calc_ss_index)" "shadowsocks"            ;;
     esac
 }
 
 # ============================================================
 # install_xray
 # 下载 xray（+ cloudflared 当 ARGO_MODE=yes），写入 config.json
-#
-# ARGO_MODE=yes：基础 config 含 Argo inbound，再追加免流
-# ARGO_MODE=no ：基础 config 为空 inbounds，由 apply_freeflow_config 写入免流
 # ============================================================
 install_xray() {
     clear
@@ -320,30 +619,32 @@ install_xray() {
 
     mkdir -p "${work_dir}" && chmod 755 "${work_dir}"
 
-    curl -sLo "${work_dir}/${server_name}.zip" \
-        "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip" \
-        || { red "xray 下载失败，请检查网络"; exit 1; }
+    # 检测并跳过已存在的二进制文件
+    if [ ! -f "${work_dir}/${server_name}" ]; then
+        curl -sLo "${work_dir}/${server_name}.zip" \
+            "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip" \
+            || { red "xray 下载失败，请检查网络"; exit 1; }
+        unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 \
+            || { red "xray 解压失败"; exit 1; }
+        chmod +x "${work_dir}/${server_name}"
+        rm -rf "${work_dir}/${server_name}.zip" \
+               "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" \
+               "${work_dir}/README.md"   "${work_dir}/LICENSE"
+    else
+        green "xray 二进制已存在，跳过下载"
+    fi
 
-    if [ "${ARGO_MODE}" = "yes" ]; then
+    if [ "${ARGO_MODE}" = "yes" ] && [ ! -f "${work_dir}/argo" ]; then
         curl -sLo "${work_dir}/argo" \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" \
             || { red "cloudflared 下载失败，请检查网络"; exit 1; }
+        chmod +x "${work_dir}/argo"
+    elif [ "${ARGO_MODE}" = "yes" ]; then
+        green "cloudflared 二进制已存在，跳过下载"
     fi
 
-    unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 \
-        || { red "xray 解压失败"; exit 1; }
-
+    # 写入基础 config
     if [ "${ARGO_MODE}" = "yes" ]; then
-        chmod +x "${work_dir}/${server_name}" "${work_dir}/argo"
-    else
-        chmod +x "${work_dir}/${server_name}"
-    fi
-    rm -rf "${work_dir}/${server_name}.zip" \
-           "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" \
-           "${work_dir}/README.md"   "${work_dir}/LICENSE"
-
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        # 基础 config：Argo inbound
         cat > "${config_dir}" << EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
@@ -369,7 +670,6 @@ install_xray() {
 }
 EOF
     else
-        # 基础 config：空 inbounds，由 apply_freeflow_config 填充
         cat > "${config_dir}" << EOF
 {
   "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
@@ -383,13 +683,14 @@ EOF
 EOF
     fi
 
-    apply_freeflow_config
+    # 按布局顺序依次写入各 inbound
+    [ "${REALITY_MODE}"  = "yes"  ] && apply_reality_config
+    [ "${FREEFLOW_MODE}" != "none" ] && apply_freeflow_config
+    [ "${SS_MODE}"       = "yes"  ] && apply_ss_config
 }
 
 # ============================================================
 # main_systemd_services
-# 写入 systemd 服务文件并启动
-# ARGO_MODE=yes 时同时启动 tunnel.service
 # ============================================================
 main_systemd_services() {
     cat > /etc/systemd/system/xray.service << EOF
@@ -440,14 +741,11 @@ EOF
 
     systemctl daemon-reload
     systemctl enable xray && systemctl start xray
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        systemctl enable tunnel && systemctl start tunnel
-    fi
+    [ "${ARGO_MODE}" = "yes" ] && systemctl enable tunnel && systemctl start tunnel
 }
 
 # ============================================================
 # alpine_openrc_services
-# 写入 OpenRC 服务脚本并注册开机自启（Alpine Linux）
 # ============================================================
 alpine_openrc_services() {
     cat > /etc/init.d/xray << 'EOF'
@@ -485,9 +783,6 @@ change_hosts() {
 
 # ============================================================
 # reset_tunnel_to_temp
-# 只重写 ExecStart/command_args 一行切换回临时隧道
-# 格式与 manage_argo 选项5的 grep -Fq 匹配字符串保持一致
-# systemd：StandardOutput/StandardError 行保持不变
 # ============================================================
 reset_tunnel_to_temp() {
     if [ -f /etc/alpine-release ]; then
@@ -501,7 +796,6 @@ reset_tunnel_to_temp() {
 
 # ============================================================
 # restart_xray / restart_argo
-# restart_argo：先删旧 argo.log 再重启，避免解析到过期域名
 # ============================================================
 restart_xray() {
     if [ -f /etc/alpine-release ]; then rc-service xray restart
@@ -517,16 +811,14 @@ restart_argo() {
 # ============================================================
 # get_argodomain
 # 从 argo.log 提取 trycloudflare.com 子域
-# 先 sleep 3 等待 cloudflared 写入，再最多轮询 5 次（每次 sleep 2）
 # ============================================================
 get_argodomain() {
     sleep 3
-    local domain i
-    i=1
+    local domain i=1
     while [ "$i" -le 5 ]; do
         domain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' \
             "${work_dir}/argo.log" 2>/dev/null | head -1)
-        if [ -n "$domain" ]; then echo "$domain"; return 0; fi
+        [ -n "$domain" ] && echo "$domain" && return 0
         sleep 2
         i=$(( i + 1 ))
     done
@@ -535,7 +827,6 @@ get_argodomain() {
 
 # ============================================================
 # print_nodes
-# 将 url.txt 内容以紫色逐行输出，跳过空行
 # ============================================================
 print_nodes() {
     echo ""
@@ -551,94 +842,96 @@ print_nodes() {
 
 # ============================================================
 # build_freeflow_link <ip>
-# 根据 FREEFLOW_MODE 输出免流节点链接行
-# UUID 从 config.json 读取，与文件始终一致
+# 根据 FREEFLOW_MODE / FF_PATH 输出免流节点链接
 # ============================================================
 build_freeflow_link() {
-    local ip="$1" uuid
+    local ip="$1" uuid path_enc
     uuid=$(get_current_uuid)
+    # 对 path 中的空格和 % 做基础编码（/ 保留）
+    path_enc=$(printf '%s' "${FF_PATH}" | sed 's|%|%25|g; s| |%20|g')
     case "${FREEFLOW_MODE}" in
         ws)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}#FreeFlow-WS"
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=ws&host=${ip}&path=${path_enc}#FreeFlow-WS"
             ;;
         httpupgrade)
-            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}#FreeFlow-HTTPUpgrade"
+            echo "vless://${uuid}@${ip}:80?encryption=none&security=none&type=httpupgrade&host=${ip}&path=${path_enc}#FreeFlow-HTTPUpgrade"
             ;;
     esac
 }
 
 # ============================================================
+# build_reality_link <ip>
+# ============================================================
+build_reality_link() {
+    local ip="$1" uuid pubkey shortid
+    local keys_file="${work_dir}/reality_keys.conf"
+    uuid=$(get_current_uuid)
+    pubkey=$(sed -n '2p' "${keys_file}" 2>/dev/null)
+    shortid=$(sed -n '3p' "${keys_file}" 2>/dev/null)
+    echo "vless://${uuid}@${ip}:${REALITY_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#Reality"
+}
+
+# ============================================================
+# build_ss_link <ip>
+# SIP002 格式：ss://base64(method:password)@host:port
+# ============================================================
+build_ss_link() {
+    local ip="$1" userinfo
+    userinfo=$(printf '%s:%s' "${SS_METHOD}" "${SS_PASSWORD}" | base64 | tr -d '\n')
+    echo "ss://${userinfo}@${ip}:${SS_PORT}#SS-${SS_METHOD}"
+}
+
+# ============================================================
 # get_info
-# 生成 url.txt 并打印
-#
-# ARGO_MODE=yes：
-#   重启 Argo，获取临时域名
-#   url.txt 第1行：Argo 节点（get_quick_tunnel 的 sed 锚定此行）
-#   url.txt 第2行：免流节点（FREEFLOW_MODE != none 时）
-#
-# ARGO_MODE=no：
-#   不涉及 Argo，直接写免流节点
-#   url.txt 只有免流节点（若 FREEFLOW_MODE=none 则文件为空）
+# 生成 url.txt 并打印；行顺序：Argo | Reality | FreeFlow | SS
 # ============================================================
 get_info() {
     clear
     local IP
     IP=$(get_realip)
+    [ -z "$IP" ] && yellow "警告：无法获取服务器 IP，依赖 IP 的节点链接将缺失"
 
-    if [ -z "$IP" ]; then
-        yellow "警告：无法获取服务器 IP，免流节点链接将缺失"
-    fi
-
-    if [ "${ARGO_MODE}" = "yes" ]; then
-        local cur_uuid argodomain
-        cur_uuid=$(get_current_uuid)
-        purple "正在获取 ArgoDomain，请稍等..."
-        restart_argo
-        argodomain=$(get_argodomain)
-        if [ -z "$argodomain" ]; then
-            yellow "未能获取 ArgoDomain，Argo 节点链接暂时无效，可稍后通过 Argo 管理菜单重新获取"
-            argodomain="<未获取到域名>"
-        else
-            green "ArgoDomain：${argodomain}"
-        fi
-        echo ""
-        {
+    # 颜色提示输出到 stderr，节点链接输出到 stdout，再重定向 stdout 到 url.txt
+    {
+        if [ "${ARGO_MODE}" = "yes" ]; then
+            local cur_uuid argodomain
+            cur_uuid=$(get_current_uuid)
+            purple "正在获取 ArgoDomain，请稍等..." >&2
+            restart_argo
+            argodomain=$(get_argodomain)
+            if [ -z "$argodomain" ]; then
+                yellow "未能获取 ArgoDomain，可稍后通过 Argo 管理菜单重新获取" >&2
+                argodomain="<未获取到域名>"
+            else
+                green "ArgoDomain：${argodomain}" >&2
+            fi
             echo "vless://${cur_uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#Argo"
-            [ -n "$IP" ] && build_freeflow_link "${IP}"
-        } > "${client_dir}"
-    else
-        echo ""
-        {
-            [ -n "$IP" ] && build_freeflow_link "${IP}"
-        } > "${client_dir}"
-    fi
+        fi
+        [ "${REALITY_MODE}"  = "yes"  ] && [ -n "$IP" ] && build_reality_link  "${IP}"
+        [ "${FREEFLOW_MODE}" != "none" ] && [ -n "$IP" ] && build_freeflow_link "${IP}"
+        [ "${SS_MODE}"       = "yes"  ] && [ -n "$IP" ] && build_ss_link        "${IP}"
+    } > "${client_dir}"
 
     print_nodes
 }
 
 # ============================================================
 # get_quick_tunnel
-# 重启 Argo，提取新临时域名，更新 url.txt 第1行的 sni/host
-# 仅在 ARGO_MODE=yes 时可用；第1行固定为 Argo 节点
 # ============================================================
 get_quick_tunnel() {
     if [ "${ARGO_MODE}" != "yes" ]; then
         yellow "未安装 Argo，此操作不可用"; return 1
     fi
     if [ ! -f "${client_dir}" ]; then
-        yellow "节点文件不存在，请先执行安装以初始化节点信息"
-        return 1
+        yellow "节点文件不存在，请先执行安装以初始化节点信息"; return 1
     fi
     yellow "正在重启 Argo 并获取新临时域名..."
     restart_argo
     local argodomain
     argodomain=$(get_argodomain)
-
     if [ -z "$argodomain" ]; then
-        yellow "未能获取临时域名，请检查网络或稍后重试"
-        return 1
+        yellow "未能获取临时域名，请检查网络或稍后重试"; return 1
     fi
-
     green "ArgoDomain：${argodomain}"
     sed -i "1s/sni=[^&]*/sni=${argodomain}/; 1s/host=[^&]*/host=${argodomain}/" "${client_dir}"
     print_nodes
@@ -646,8 +939,43 @@ get_quick_tunnel() {
 }
 
 # ============================================================
+# _update_reality_url <ip>  原地替换 url.txt 中的 Reality 行
+# ============================================================
+_update_reality_url() {
+    local ip="$1" new_link escaped
+    new_link=$(build_reality_link "${ip}")
+    if grep -q 'security=reality' "${client_dir}" 2>/dev/null; then
+        escaped=$(printf '%s\n' "${new_link}" | sed 's/[\/&]/\\&/g')
+        sed -i "/security=reality/c\\${escaped}" "${client_dir}"
+    fi
+}
+
+# ============================================================
+# _update_ss_url <ip>  原地替换 url.txt 中的 SS 行
+# ============================================================
+_update_ss_url() {
+    local ip="$1" new_link escaped
+    new_link=$(build_ss_link "${ip}")
+    if grep -q '^ss://' "${client_dir}" 2>/dev/null; then
+        escaped=$(printf '%s\n' "${new_link}" | sed 's/[\/&]/\\&/g')
+        sed -i "/^ss:\/\//c\\${escaped}" "${client_dir}"
+    fi
+}
+
+# ============================================================
+# _update_freeflow_url <ip>  原地替换 url.txt 中的免流行
+# ============================================================
+_update_freeflow_url() {
+    local ip="$1" new_link escaped
+    new_link=$(build_freeflow_link "${ip}")
+    if grep -q '#FreeFlow' "${client_dir}" 2>/dev/null; then
+        escaped=$(printf '%s\n' "${new_link}" | sed 's/[\/&]/\\&/g')
+        sed -i "/#FreeFlow/c\\${escaped}" "${client_dir}"
+    fi
+}
+
+# ============================================================
 # manage_argo - Argo 隧道管理
-# ARGO_MODE=no 时直接提示不可用
 # ============================================================
 manage_argo() {
     if [ "${ARGO_MODE}" != "yes" ]; then
@@ -682,9 +1010,7 @@ manage_argo() {
             yellow "固定隧道回源端口为 ${ARGO_PORT}，请在 CF 后台配置对应 ingress"
             echo ""
             reading "请输入你的 Argo 域名: " argo_domain
-            if [ -z "$argo_domain" ]; then
-                red "Argo 域名不能为空"; return
-            fi
+            [ -z "$argo_domain" ] && red "Argo 域名不能为空" && return
             reading "请输入 Argo 密钥（token 或 json）: " argo_auth
 
             if echo "$argo_auth" | grep -q "TunnelSecret"; then
@@ -758,15 +1084,147 @@ EOF
 }
 
 # ============================================================
-# change_config - 修改 UUID / Argo 端口 / 免流方式
+# manage_reality - Reality 节点管理
+# ============================================================
+manage_reality() {
+    if [ "${REALITY_MODE}" != "yes" ]; then
+        yellow "未安装 Reality，此管理不可用"; sleep 1; menu; return
+    fi
+    clear; echo ""
+    green  "Reality 当前配置："
+    skyblue "  SNI  : ${REALITY_SNI}"
+    skyblue "  Port : ${REALITY_PORT}"
+    echo   "=========================="
+    green  "1. 修改 SNI"
+    green  "2. 修改监听端口"
+    purple "3. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " choice
+
+    case "${choice}" in
+        1)
+            reading "请输入新的 SNI（回车保持当前 ${REALITY_SNI}）: " new_sni
+            [ -z "${new_sni}" ] && new_sni="${REALITY_SNI}"
+            REALITY_SNI="${new_sni}"
+            printf '%s\n%s\n' "${REALITY_SNI}" "${REALITY_PORT}" > "${reality_conf}"
+            apply_reality_config
+            restart_xray
+            local IP; IP=$(get_realip)
+            [ -n "$IP" ] && _update_reality_url "${IP}"
+            green "SNI 已修改为：${REALITY_SNI}"
+            print_nodes
+            ;;
+        2)
+            reading "请输入新的监听端口（回车保持当前 ${REALITY_PORT}）: " new_rp
+            if [ -z "${new_rp}" ]; then
+                new_rp="${REALITY_PORT}"
+            elif ! echo "${new_rp}" | grep -qE '^[0-9]+$' || \
+                 [ "${new_rp}" -lt 1 ] || [ "${new_rp}" -gt 65535 ]; then
+                red "端口无效，请输入 1-65535 的整数"; return
+            fi
+            REALITY_PORT="${new_rp}"
+            printf '%s\n%s\n' "${REALITY_SNI}" "${REALITY_PORT}" > "${reality_conf}"
+            apply_reality_config
+            restart_xray
+            local IP; IP=$(get_realip)
+            [ -n "$IP" ] && _update_reality_url "${IP}"
+            green "Reality 端口已修改为：${REALITY_PORT}"
+            print_nodes
+            ;;
+        3) menu ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
+# ============================================================
+# manage_ss - Shadowsocks 节点管理
+# ============================================================
+manage_ss() {
+    if [ "${SS_MODE}" != "yes" ]; then
+        yellow "未安装 Shadowsocks，此管理不可用"; sleep 1; menu; return
+    fi
+    clear; echo ""
+    green  "Shadowsocks 当前配置："
+    skyblue "  Port    : ${SS_PORT}"
+    skyblue "  Method  : ${SS_METHOD}"
+    skyblue "  Password: ${SS_PASSWORD}"
+    echo   "=============================="
+    green  "1. 修改端口"
+    green  "2. 修改密码"
+    green  "3. 修改加密方式"
+    purple "4. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " choice
+
+    case "${choice}" in
+        1)
+            reading "请输入新的端口（回车保持当前 ${SS_PORT}）: " new_sp
+            if [ -z "${new_sp}" ]; then
+                new_sp="${SS_PORT}"
+            elif ! echo "${new_sp}" | grep -qE '^[0-9]+$' || \
+                 [ "${new_sp}" -lt 1 ] || [ "${new_sp}" -gt 65535 ]; then
+                red "端口无效，请输入 1-65535 的整数"; return
+            fi
+            SS_PORT="${new_sp}"
+            _save_ss_conf
+            apply_ss_config
+            restart_xray
+            local IP; IP=$(get_realip)
+            [ -n "$IP" ] && _update_ss_url "${IP}"
+            green "SS 端口已修改为：${SS_PORT}"
+            print_nodes
+            ;;
+        2)
+            reading "请输入新的密码（回车自动生成）: " new_pw
+            [ -z "${new_pw}" ] && new_pw=$(cat /proc/sys/kernel/random/uuid | tr -d '-' | cut -c1-16)
+            SS_PASSWORD="${new_pw}"
+            _save_ss_conf
+            apply_ss_config
+            restart_xray
+            local IP; IP=$(get_realip)
+            [ -n "$IP" ] && _update_ss_url "${IP}"
+            green "SS 密码已修改"
+            print_nodes
+            ;;
+        3)
+            echo ""
+            green  "请选择加密方式："
+            skyblue "-----------------------------"
+            green  "1. aes-256-gcm（推荐）"
+            green  "2. aes-128-gcm"
+            green  "3. chacha20-poly1305"
+            green  "4. xchacha20-poly1305"
+            skyblue "-----------------------------"
+            reading "请输入选择(1-4): " m_choice
+            case "${m_choice}" in
+                2) SS_METHOD="aes-128-gcm"       ;;
+                3) SS_METHOD="chacha20-poly1305"  ;;
+                4) SS_METHOD="xchacha20-poly1305" ;;
+                *) SS_METHOD="aes-256-gcm"        ;;
+            esac
+            _save_ss_conf
+            apply_ss_config
+            restart_xray
+            local IP; IP=$(get_realip)
+            [ -n "$IP" ] && _update_ss_url "${IP}"
+            green "SS 加密方式已修改为：${SS_METHOD}"
+            print_nodes
+            ;;
+        4) menu ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
+# ============================================================
+# change_config - 修改 UUID / Argo 端口 / 免流方式 / 免流 path
 # ============================================================
 change_config() {
     local ff_label
     case "${FREEFLOW_MODE}" in
-        ws)          ff_label="VLESS+WS（当前）"          ;;
-        httpupgrade) ff_label="VLESS+HTTPUpgrade（当前）" ;;
-        none)        ff_label="未安装（当前）"             ;;
-        *)           ff_label="未知"                      ;;
+        ws)          ff_label="VLESS+WS（当前，path=${FF_PATH}）"          ;;
+        httpupgrade) ff_label="VLESS+HTTPUpgrade（当前，path=${FF_PATH}）" ;;
+        none)        ff_label="未安装（当前）"                              ;;
+        *)           ff_label="未知"                                       ;;
     esac
 
     clear; echo ""
@@ -778,6 +1236,10 @@ change_config() {
     fi
     green  "3. 变更免流方式（${ff_label}）"
     skyblue "--------------------------------"
+    if [ "${FREEFLOW_MODE}" != "none" ]; then
+        green  "4. 修改免流 path（当前：${FF_PATH}）"
+        skyblue "------------------------------------"
+    fi
     purple "0. 返回主菜单"
     skyblue "------------"
     reading "请输入选择: " choice
@@ -801,9 +1263,7 @@ change_config() {
                 red "无效的选项！"; return
             fi
             reading "请输入新的 Argo 回源端口（回车随机）: " new_port
-            if [ -z "$new_port" ]; then
-                new_port=$(shuf -i 2000-65000 -n 1)
-            fi
+            [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
             if ! echo "$new_port" | grep -qE '^[0-9]+$' || \
                [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
                 red "端口无效，请输入 1-65535 的整数"; return
@@ -811,8 +1271,7 @@ change_config() {
             jq --argjson p "$new_port" '.inbounds[0].port = $p' "$config_dir" \
                 > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
             if [ -f /etc/alpine-release ]; then
-                sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" \
-                    /etc/init.d/tunnel
+                sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" /etc/init.d/tunnel
             else
                 sed -i "s|http://localhost:[0-9]*|http://localhost:${new_port}|g" \
                     /etc/systemd/system/tunnel.service
@@ -827,25 +1286,44 @@ change_config() {
             fi
             local old_mode="${FREEFLOW_MODE}"
             ask_freeflow_mode
-            if [ "${FREEFLOW_MODE}" = "${old_mode}" ]; then
-                yellow "免流方式未变更"; return
-            fi
+            # 模式或 path 有任一变更均需重新应用
             apply_freeflow_config
-            local argo_line ip_now
-            ip_now=$(get_realip)
-            if [ "${ARGO_MODE}" = "yes" ]; then
-                argo_line=$(head -1 "${client_dir}")
-                {
-                    echo "${argo_line}"
-                    [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
-                } > "${client_dir}"
-            else
-                {
-                    [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
-                } > "${client_dir}"
+            # 重建 url.txt（保留其他协议行，刷新免流行）
+            local ip_now; ip_now=$(get_realip)
+            {
+                [ "${ARGO_MODE}"    = "yes"  ] && grep '#Argo$'           "${client_dir}" 2>/dev/null
+                [ "${REALITY_MODE}" = "yes"  ] && grep 'security=reality' "${client_dir}" 2>/dev/null
+                [ "${FREEFLOW_MODE}" != "none" ] && [ -n "$ip_now" ] && build_freeflow_link "${ip_now}"
+                [ "${SS_MODE}"      = "yes"  ] && grep '^ss://'           "${client_dir}" 2>/dev/null
+            } > "${client_dir}.new" && mv "${client_dir}.new" "${client_dir}"
+            # 若之前有免流但现在选了 none，从 config 中删除免流 inbound
+            if [ "${old_mode}" != "none" ] && [ "${FREEFLOW_MODE}" = "none" ]; then
+                _jq_del_inbound "$(calc_freeflow_index)" "${old_mode}"
             fi
             restart_xray
             green "免流方式已变更"
+            print_nodes
+            ;;
+        4)
+            if [ "${FREEFLOW_MODE}" = "none" ]; then
+                red "无效的选项！"; return
+            fi
+            reading "请输入新的免流 path（回车保持当前 ${FF_PATH}）: " new_path
+            if [ -z "${new_path}" ]; then
+                new_path="${FF_PATH}"
+            else
+                case "${new_path}" in
+                    /*) : ;;
+                    *)  new_path="/${new_path}" ;;
+                esac
+            fi
+            FF_PATH="${new_path}"
+            _save_freeflow_conf
+            apply_freeflow_config
+            local ip_now; ip_now=$(get_realip)
+            [ -n "$ip_now" ] && _update_freeflow_url "${ip_now}"
+            restart_xray
+            green "免流 path 已修改为：${FF_PATH}"
             print_nodes
             ;;
         0) menu ;;
@@ -869,7 +1347,6 @@ check_nodes() {
 
 # ============================================================
 # uninstall_xray - 停止服务，删除服务文件和工作目录
-# ARGO_MODE=yes 时同时停止并删除 tunnel 服务
 # ============================================================
 uninstall_xray() {
     reading "确定要卸载 xray-2go 吗？(y/n): " choice
@@ -877,7 +1354,7 @@ uninstall_xray() {
         y|Y)
             yellow "正在卸载..."
             if [ -f /etc/alpine-release ]; then
-                rc-service xray stop   2>/dev/null
+                rc-service xray stop 2>/dev/null
                 rc-update del xray default 2>/dev/null
                 rm -f /etc/init.d/xray
                 if [ "${ARGO_MODE}" = "yes" ]; then
@@ -897,6 +1374,7 @@ uninstall_xray() {
                 systemctl daemon-reload
             fi
             rm -rf "${work_dir}"
+            rm -f "${shortcut_path}"
             green "Xray-2go 卸载完成"
             ;;
         *) purple "已取消卸载" ;;
@@ -910,38 +1388,52 @@ trap 'red "已取消操作"; exit' INT
 # ============================================================
 menu() {
     while true; do
-        local xray_status argo_status cx ff_display argo_display
+        local xray_status argo_status cx ff_display argo_display reality_display ss_display
         xray_status=$(check_xray); cx=$?
         argo_status=$(check_argo)
         case "${FREEFLOW_MODE}" in
-            ws)          ff_display="WS"          ;;
-            httpupgrade) ff_display="HTTPUpgrade" ;;
-            none)        ff_display="无"          ;;
-            *)           ff_display="未知"        ;;
+            ws)          ff_display="WS（path=${FF_PATH}）"          ;;
+            httpupgrade) ff_display="HTTPUpgrade（path=${FF_PATH}）" ;;
+            none)        ff_display="无"                              ;;
+            *)           ff_display="未知"                           ;;
         esac
         if [ "${ARGO_MODE}" = "yes" ]; then
             argo_display="${argo_status}"
         else
             argo_display="未启用"
         fi
+        if [ "${REALITY_MODE}" = "yes" ]; then
+            reality_display="已启用（SNI=${REALITY_SNI} Port=${REALITY_PORT}）"
+        else
+            reality_display="未启用"
+        fi
+        if [ "${SS_MODE}" = "yes" ]; then
+            ss_display="已启用（Port=${SS_PORT} ${SS_METHOD}）"
+        else
+            ss_display="未启用"
+        fi
 
         clear; echo ""
         purple "=== Xray-2go 精简版 ==="
-        purple " Xray 状态: ${xray_status}"
-        purple " Argo 状态: ${argo_display}"
-        purple " 免流模式:  ${ff_display}"
+        purple " Xray 状态:   ${xray_status}"
+        purple " Argo 状态:   ${argo_display}"
+        purple " Reality:     ${reality_display}"
+        purple " 免流模式:    ${ff_display}"
+        purple " Shadowsocks: ${ss_display}"
         echo   "========================"
         green  "1. 安装 Xray-2go"
         red    "2. 卸载 Xray-2go"
         echo   "================="
         green  "3. Argo 隧道管理"
+        green  "4. Reality 管理"
+        green  "5. Shadowsocks 管理"
         echo   "================="
-        green  "4. 查看节点信息"
-        green  "5. 修改节点配置"
+        green  "6. 查看节点信息"
+        green  "7. 修改节点配置"
         echo   "================="
         red    "0. 退出脚本"
         echo   "==========="
-        reading "请输入选择(0-5): " choice
+        reading "请输入选择(0-7): " choice
         echo ""
 
         case "${choice}" in
@@ -950,7 +1442,9 @@ menu() {
                     yellow "Xray-2go 已安装！"
                 else
                     ask_argo_mode
+                    ask_reality_mode
                     ask_freeflow_mode
+                    ask_ss_mode
                     manage_packages install jq unzip
                     install_xray
                     if command -v systemctl > /dev/null 2>&1; then
@@ -963,19 +1457,25 @@ menu() {
                     else
                         red "不支持的 init 系统"; exit 1
                     fi
+                    install_shortcut
                     get_info
                 fi
                 ;;
             2) uninstall_xray ;;
             3) manage_argo ;;
-            4) check_nodes ;;
-            5) change_config ;;
+            4) manage_reality ;;
+            5) manage_ss ;;
+            6) check_nodes ;;
+            7) change_config ;;
             0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 5" ;;
+            *) red "无效的选项，请输入 0 到 7" ;;
         esac
         printf '\033[1;91m按回车键继续...\033[0m'
         read -r _dummy
     done
 }
+
+# ── 安装快捷方式（若未存在） ─────────────────────────────────
+[ ! -f "${shortcut_path}" ] && install_shortcut 2>/dev/null
 
 menu
