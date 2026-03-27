@@ -27,7 +27,7 @@ shortcut_path="/usr/local/bin/s"
 
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 export ARGO_PORT=${ARGO_PORT:-'8080'}
-export ARGO_XHTTP_PORT=${ARGO_XHTTP_PORT:-'8081'}
+export ARGO_XHTTP_PORT=${ARGO_XHTTP_PORT:-'8080'}
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
 
