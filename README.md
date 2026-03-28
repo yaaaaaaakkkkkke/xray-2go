@@ -13,11 +13,6 @@ Debian / Ubuntu / CentOS / Alpine / Fedora / AlmaLinux / Rocky Linux / Amazon Li
 bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh)
 ```
 
-**带变量运行（无交互，修改为自己的参数）**
-```bash
-UUID=自定义UUID CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh)
-```
-
 ## 可用环境变量
 
 | 变量 | 说明 | 默认值 |
