@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v2.0 — 工业级重构
+# xray-2go v2.0
 # 协议插件架构：Argo WS/XHTTP + FreeFlow WS/HTTPUpgrade/XHTTP
 # 首选平台：Debian 12 / Ubuntu | 兼容：CentOS/RHEL、Alpine (OpenRC)
 # 架构分层：UI → Platform → Config-IO → JSON-Plugin → Link-Plugin →
