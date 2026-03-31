@@ -37,7 +37,7 @@ die()    { red "$1"; exit 1; }
 # ── 平台检测 ─────────────────────────────────────────────────
 is_alpine() { [ -f /etc/alpine-release ]; }
 
-# ── 全局状态（运行时可变）────────────────────────────────────
+# ── 全局变量（运行时可变）────────────────────────────────────
 ARGO_MODE="yes"
 ARGO_PROTOCOL="ws"
 FREEFLOW_MODE="none"
@@ -48,6 +48,7 @@ UUID="${UUID:-}"
 
 # ── 生成 UUID（兼容 busybox/Alpine，不依赖 GNU sed）─────────
 _gen_uuid() {
+    # 优先内核接口，次之纯 POSIX 方式（od + awk，无 sed 依赖）
     if [ -r /proc/sys/kernel/random/uuid ]; then
         cat /proc/sys/kernel/random/uuid
     else
@@ -62,21 +63,21 @@ _gen_uuid() {
     fi
 }
 
-# ── 配置管理器（集中读写所有持久化状态）──────────────────────
-load_all_config() {
+# ── 读取持久化配置 ───────────────────────────────────────────
+_load_config() {
     [ -z "${UUID}" ] && UUID=$(_gen_uuid)
 
     local raw
-    raw=$(cat "${ARGO_MODE_CONF}" 2>/dev/null || echo "yes")
+    raw=$(cat "${ARGO_MODE_CONF}" 2>/dev/null)
     case "${raw}" in yes|no) ARGO_MODE="${raw}" ;; *) ARGO_MODE="yes" ;; esac
 
-    raw=$(cat "${ARGO_PROTO_CONF}" 2>/dev/null || echo "ws")
+    raw=$(cat "${ARGO_PROTO_CONF}" 2>/dev/null)
     case "${raw}" in ws|xhttp) ARGO_PROTOCOL="${raw}" ;; *) ARGO_PROTOCOL="ws" ;; esac
 
     if [ -f "${FREEFLOW_CONF}" ]; then
         local l1 l2
-        l1=$(sed -n '1p' "${FREEFLOW_CONF}" 2>/dev/null || echo "none")
-        l2=$(sed -n '2p' "${FREEFLOW_CONF}" 2>/dev/null || echo "/")
+        l1=$(sed -n '1p' "${FREEFLOW_CONF}" 2>/dev/null)
+        l2=$(sed -n '2p' "${FREEFLOW_CONF}" 2>/dev/null)
         case "${l1}" in ws|httpupgrade|xhttp) FREEFLOW_MODE="${l1}" ;; *) FREEFLOW_MODE="none" ;; esac
         [ -n "${l2}" ] && FF_PATH="${l2}"
     fi
@@ -84,20 +85,20 @@ load_all_config() {
     if [ "${ARGO_MODE}" = "yes" ] && [ -f "${CONFIG_FILE}" ]; then
         local p
         p=$(jq -r 'first(.inbounds[]? | select(.listen=="127.0.0.1") | .port) // empty' \
-            "${CONFIG_FILE}" 2>/dev/null || echo "8080")
+            "${CONFIG_FILE}" 2>/dev/null)
         case "${p}" in ''|*[!0-9]*) : ;; *) ARGO_PORT="${p}" ;; esac
     fi
 
     if [ -f "${RESTART_CONF}" ]; then
         local ri
-        ri=$(cat "${RESTART_CONF}" 2>/dev/null || echo "0")
+        ri=$(cat "${RESTART_CONF}" 2>/dev/null)
         case "${ri}" in ''|*[!0-9]*) : ;; *) RESTART_INTERVAL="${ri}" ;; esac
     fi
 }
-load_all_config
+_load_config
 
-# ── 服务管理器抽象层（systemd / OpenRC）──────────────────────
-ServiceManager() {
+# ── 服务控制 ─────────────────────────────────────────────────
+svc() {
     local act="$1" name="$2"
     if is_alpine; then
         case "${act}" in
@@ -145,7 +146,7 @@ pkg_require() {
     elif command -v apk     >/dev/null 2>&1; then apk add          "${pkg}" >/dev/null 2>&1
     else die "未找到包管理器，无法安装 ${pkg}"
     fi
-    hash -r 2>/dev/null || true
+    hash -r 2>/dev/null || true   # 刷新 shell hash 缓存
     command -v "${bin}" >/dev/null 2>&1 || die "${pkg} 安装失败，请手动安装后重试"
 }
 
@@ -162,19 +163,23 @@ jq_edit() {
     fi
 }
 
-# ── 端口占用检测 ─────────────────────────────────────────────
+# ── 端口占用检测（兼容 ss / netstat / /proc/net/tcp）─────────
 port_in_use() {
     local p="$1"
     if command -v ss >/dev/null 2>&1; then
-        ss -tlnH 2>/dev/null | awk -v p=":${p}" '$4 ~ p"$" || $4 ~ p" " {found=1} END{exit !found}'
+        ss -tlnH 2>/dev/null | \
+            awk -v p=":${p}" '$4 ~ p"$" || $4 ~ p" " {found=1} END{exit !found}'
         return
     fi
     if command -v netstat >/dev/null 2>&1; then
-        netstat -tlnp 2>/dev/null | awk -v p=":${p}" '$4 ~ p"$" || $4 ~ p" " {found=1} END{exit !found}'
+        netstat -tlnp 2>/dev/null | \
+            awk -v p=":${p}" '$4 ~ p"$" || $4 ~ p" " {found=1} END{exit !found}'
         return
     fi
+    # fallback：/proc/net/tcp + tcp6（端口为大端十六进制）
     local hex; hex=$(printf '%04X' "${p}")
-    awk -v h="${hex}" 'NR>1 && substr($2, index($2,":")+1, 4)==h {found=1} END{exit !found}' \
+    awk -v h="${hex}" \
+        'NR>1 && substr($2, index($2,":")+1, 4)==h {found=1} END{exit !found}' \
         /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
@@ -204,7 +209,7 @@ get_uuid() {
     echo "${id:-${UUID}}"
 }
 
-# ── Xray Config Builder（模块化 inbound 生成）────────────────
+# ── JSON 构建（jq -n 保证合法性，所有值通过参数传入）────────
 _argo_inbound() {
     local uuid; uuid=$(get_uuid)
     if [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
@@ -256,7 +261,7 @@ _freeflow_inbound() {
     esac
 }
 
-# ── 写入完整 config.json ─────────────────────────────────────
+# ── 写入完整 config.json（写后用 xray -test 验证）────────────
 write_config() {
     mkdir -p "${WORK_DIR}"
     local ib_arg='{}'
@@ -274,6 +279,7 @@ write_config() {
             ]
         }' > "${CONFIG_FILE}" || die "生成 config.json 失败"
 
+    # 二次验证：xray 语法检查（仅在二进制已存在时执行）
     if [ -x "${XRAY_BIN}" ]; then
         "${XRAY_BIN}" -test -c "${CONFIG_FILE}" >/dev/null 2>&1 \
             || die "config.json 验证失败，请检查配置"
@@ -293,7 +299,7 @@ replace_argo_inbound() {
     ' --argjson ib "${ib}"
 }
 
-# ── 应用 FreeFlow 配置 ───────────────────────────────────────
+# ── 应用 FreeFlow 配置（删 port 80，按需注入）───────────────
 apply_freeflow() {
     jq_edit "${CONFIG_FILE}" 'del(.inbounds[]? | select(.port == 80))' || return 1
     if [ "${FREEFLOW_MODE}" != "none" ]; then
@@ -320,7 +326,7 @@ detect_arch() {
     esac
 }
 
-# ── 下载二进制 ───────────────────────────────────────────────
+# ── 下载二进制文件 ───────────────────────────────────────────
 download_xray() {
     local arch_xray="$1"
     yellow "下载 Xray (${arch_xray})..."
@@ -330,6 +336,7 @@ download_xray() {
         || { rm -f "${zipfile}"; die "Xray 下载失败，请检查网络"; }
     unzip -t "${zipfile}" >/dev/null 2>&1 \
         || { rm -f "${zipfile}"; die "Xray zip 文件损坏"; }
+    # 仅解压 xray 二进制，跳过 geoip/geosite/README/LICENSE
     unzip -o "${zipfile}" xray -d "${WORK_DIR}/" >/dev/null 2>&1 \
         || { rm -f "${zipfile}"; die "Xray 解压失败"; }
     rm -f "${zipfile}"
@@ -370,7 +377,7 @@ install_xray() {
     green "安装完成"
 }
 
-# ── CentOS/RHEL 时间修正 ─────────────────────────────────────
+# ── CentOS/RHEL 系时间修正 ───────────────────────────────────
 fix_centos_time() {
     [ -f /etc/redhat-release ] || [ -f /etc/centos-release ] || return 0
     local pm; command -v dnf >/dev/null 2>&1 && pm="dnf" || pm="yum"
@@ -380,7 +387,7 @@ fix_centos_time() {
     ${pm} update -y ca-certificates >/dev/null 2>&1 || true
 }
 
-# ── Tunnel 服务文件生成 ──────────────────────────────────────
+# ── 写 tunnel 服务文件 ───────────────────────────────────────
 _write_tunnel_service_systemd() {
     local exec_cmd="$1"
     cat > /etc/systemd/system/tunnel.service << EOF
@@ -414,7 +421,7 @@ EOF
     chmod +x /etc/init.d/tunnel
 }
 
-# ── 注册系统服务 ─────────────────────────────────────────────
+# ── 注册系统服务（路径全部使用常量）─────────────────────────
 register_services() {
     if command -v systemctl >/dev/null 2>&1; then
         cat > /etc/systemd/system/xray.service << EOF
@@ -446,7 +453,9 @@ EOF
             systemctl enable tunnel 2>/dev/null && systemctl start tunnel 2>/dev/null \
                 || die "tunnel 服务启动失败"
         fi
+
     elif command -v rc-update >/dev/null 2>&1; then
+        # OpenRC（Alpine 等）—— 使用常量，不 hardcode 路径
         cat > /etc/init.d/xray << EOF
 #!/sbin/openrc-run
 description="Xray service"
@@ -462,11 +471,13 @@ EOF
             _write_tunnel_service_openrc "${tmp_cmd}"
             rc-update add tunnel default
         fi
+        # Alpine 特殊处理
         echo "0 0" > /proc/sys/net/ipv4/ping_group_range 2>/dev/null || true
         sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts 2>/dev/null || true
         sed -i '2s/.*/::1         localhost/'  /etc/hosts 2>/dev/null || true
         rc-service xray restart 2>/dev/null || die "xray 服务启动失败"
-        [ "${ARGO_MODE}" = "yes" ] && { rc-service tunnel restart 2>/dev/null || die "tunnel 服务启动失败"; }
+        [ "${ARGO_MODE}" = "yes" ] && \
+            { rc-service tunnel restart 2>/dev/null || die "tunnel 服务启动失败"; }
     else
         die "不支持的 init 系统（需要 systemd 或 OpenRC）"
     fi
@@ -492,12 +503,14 @@ configure_fixed_tunnel() {
     local exec_cmd
     if echo "${auth}" | grep -q "TunnelSecret"; then
         echo "${auth}" | jq . >/dev/null 2>&1 || { red "JSON 凭证格式不合法"; return 1; }
+        # 严格提取 TunnelID，不使用脆弱的 keys_unsorted fallback
         local tid
         tid=$(echo "${auth}" | jq -r '
             if (.TunnelID? // "") != "" then .TunnelID
             elif (.AccountTag? // "") != "" then .AccountTag
             else empty end' 2>/dev/null)
         [ -z "${tid}" ] && { red "无法从 JSON 中提取 TunnelID/AccountTag"; return 1; }
+        # 防止 YAML 注入：tid 不得含换行、引号、冒号
         case "${tid}" in
             *$'\n'*|*'"'*|*"'"*|*':'*) red "TunnelID 含非法字符，拒绝写入"; return 1 ;;
         esac
@@ -556,7 +569,7 @@ reset_to_temp_tunnel() {
     replace_argo_inbound || red "更新 xray inbound 失败"
 }
 
-# ── 获取 Argo 临时域名 ───────────────────────────────────────
+# ── 获取 Argo 临时域名（指数退避，最多等约 30s）─────────────
 get_temp_domain() {
     local domain delay=3 i=1
     sleep 3
@@ -607,6 +620,8 @@ print_nodes() {
 }
 
 # ── 生成并保存节点信息 ───────────────────────────────────────
+# $1 = argo_domain（已知时直接用，跳过交互）
+# $2 = skip_select（非空时跳过隧道类型选择）
 get_info() {
     clear
     local CFIP="${CFIP:-cdns.doon.eu.org}" CFPORT="${CFPORT:-443}"
@@ -616,6 +631,7 @@ get_info() {
     [ -z "${ip}" ] && yellow "警告：无法获取服务器 IP，FreeFlow 节点链接将缺失"
     uuid=$(get_uuid)
 
+    # ── 阶段一：所有交互在主 shell 中 ──────────────────────
     if [ "${ARGO_MODE}" = "yes" ] && [ -z "${skip_select}" ]; then
         local choice
         echo ""
@@ -662,6 +678,7 @@ get_info() {
         fi
     fi
 
+    # ── 阶段二：纯输出写文件，零交互 ────────────────────────
     {
         if [ "${ARGO_MODE}" = "yes" ]; then
             if [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
@@ -761,7 +778,7 @@ remove_auto_restart() {
     rm -f "${tmp}"
 }
 
-# ── 更新脚本/快捷方式 ────────────────────────────────────────
+# ── 更新脚本/快捷方式（原子替换，保留备份）──────────────────
 install_shortcut() {
     yellow "正在拉取最新脚本..."
     local tmp="/usr/local/bin/xray2go.tmp" dest="/usr/local/bin/xray2go"
@@ -770,6 +787,7 @@ install_shortcut() {
         || { rm -f "${tmp}"; red "拉取失败，请检查网络"; return 1; }
     bash -n "${tmp}" 2>/dev/null \
         || { rm -f "${tmp}"; red "下载的脚本语法验证失败，已中止"; return 1; }
+    # 原子替换：保留旧版备份
     [ -f "${dest}" ] && cp -f "${dest}" "${dest}.bak" 2>/dev/null || true
     mv "${tmp}" "${dest}"
     chmod +x "${dest}"
@@ -802,6 +820,7 @@ check_argo() {
     fi
 }
 
+# ── 判断当前是否为固定隧道 ───────────────────────────────────
 is_fixed_tunnel() {
     local svc_file
     if command -v systemctl >/dev/null 2>&1; then
@@ -809,6 +828,7 @@ is_fixed_tunnel() {
     else
         svc_file="/etc/init.d/tunnel"
     fi
+    # 文件不存在则视为非固定隧道（避免误判）
     [ -f "${svc_file}" ] || return 1
     ! grep -Fq -- "--url http://localhost:${ARGO_PORT}" "${svc_file}" 2>/dev/null
 }
@@ -986,8 +1006,8 @@ manage_argo() {
             restart_xray && restart_argo
             green "回源端口已修改为：${_p}"
             ;;
-        6) ServiceManager start tunnel; green "隧道已启动" ;;
-        7) ServiceManager stop  tunnel; green "隧道已停止" ;;
+        6) svc start tunnel; green "隧道已启动" ;;
+        7) svc stop  tunnel; green "隧道已停止" ;;
         0) return ;;
         *) red "无效选项" ;;
     esac
@@ -1078,14 +1098,14 @@ uninstall_all() {
     yellow "正在卸载..."
     remove_auto_restart
     if command -v systemctl >/dev/null 2>&1; then
-        ServiceManager stop xray;   ServiceManager disable xray
-        ServiceManager stop tunnel; ServiceManager disable tunnel
+        svc stop xray;   svc disable xray
+        svc stop tunnel; svc disable tunnel
         rm -f /etc/systemd/system/xray.service \
               /etc/systemd/system/tunnel.service
         systemctl daemon-reload 2>/dev/null || true
     else
-        ServiceManager stop xray;   ServiceManager disable xray
-        ServiceManager stop tunnel; ServiceManager disable tunnel
+        svc stop xray;   svc disable xray
+        svc stop tunnel; svc disable tunnel
         rm -f /etc/init.d/xray /etc/init.d/tunnel
     fi
     rm -rf "${WORK_DIR}"
@@ -1150,6 +1170,7 @@ menu() {
                     [ "${ARGO_MODE}" = "yes" ] && ask_argo_protocol
                     ask_freeflow_mode
 
+                    # 端口冲突前置检查（警告，安装后可通过管理菜单修改）
                     [ "${ARGO_MODE}" = "yes" ] && port_in_use "${ARGO_PORT}" && \
                         yellow "⚠ 端口 ${ARGO_PORT} 已被占用，可安装后通过 Argo 管理修改"
                     [ "${FREEFLOW_MODE}" != "none" ] && port_in_use 80 && \
