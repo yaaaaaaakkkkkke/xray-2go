@@ -63,43 +63,44 @@ _ARCH_XRAY=""          # xray 架构标识
 _SYSTEMD_DIRTY=0       # deferred daemon-reload 标志
 
 # ==============================================================================
-# §3 ── UI 层（统一色彩方案 + 信息等级 + 交互原语）
+# §3 ── UI 层（现代 CLI 极简风格）
 # ==============================================================================
-# ── ANSI 调色板（信息等级映射）
+# ── ANSI 调色板
 readonly _C_RST=$'\033[0m'
 readonly _C_BOLD=$'\033[1m'
-readonly _C_RED=$'\033[1;91m'    # ERROR / 危险操作
-readonly _C_GRN=$'\033[1;32m'   # OK / 成功 / 推荐项
-readonly _C_YLW=$'\033[1;33m'   # WARN / 注意
-readonly _C_BLU=$'\033[1;34m'   # 调试（保留）
-readonly _C_PUR=$'\033[1;35m'   # 标题 / 主题色
-readonly _C_CYN=$'\033[1;36m'   # INFO / 步骤 / 节点链接
+readonly _C_DIM=$'\033[2m'
+readonly _C_RED=$'\033[31m'    # 错误 / 卸载
+readonly _C_GRN=$'\033[32m'    # 成功 / 运行中
+readonly _C_YLW=$'\033[33m'    # 警告 / 未运行
+readonly _C_BLU=$'\033[34m'    # 强调色
+readonly _C_CYN=$'\033[36m'    # 提示 / 主色调
 
-log_info()  { printf "${_C_CYN}[INFO]${_C_RST} %s\n"    "$*"; }
-log_ok()    { printf "${_C_GRN}[ OK ]${_C_RST} %s\n"    "$*"; }
-log_warn()  { printf "${_C_YLW}[WARN]${_C_RST} %s\n"    "$*" >&2; }
-log_error() { printf "${_C_RED}[ERR ]${_C_RST} %s\n"    "$*" >&2; }
-log_step()  { printf "${_C_PUR}[....] %s${_C_RST}\n"    "$*"; }
-log_title() { printf "\n${_C_BOLD}${_C_PUR}%s${_C_RST}\n" "$*"; }
+# ── 现代符号与信息等级
+log_info()  { printf "  ${_C_CYN}ℹ${_C_RST} %s\n"    "$*"; }
+log_ok()    { printf "  ${_C_GRN}✔${_C_RST} %s\n"    "$*"; }
+log_warn()  { printf "  ${_C_YLW}⚠${_C_RST} %s\n"    "$*" >&2; }
+log_error() { printf "  ${_C_RED}✖${_C_RST} %s\n"    "$*" >&2; }
+log_step()  { printf "  ${_C_BLU}➜${_C_RST} %s\n"    "$*"; }
+log_title() { printf "\n${_C_BOLD}${_C_BLU}  %s${_C_RST}\n\n" "$*"; }
 die()       { log_error "$1"; exit "${2:-1}"; }
 
-# ── 交互提示：prompt 走 stderr，read 强制走 /dev/tty（兼容管道/重定向场景）
+# ── 交互提示
 prompt() {
     local _msg="$1" _var="$2"
-    printf "${_C_RED}%s${_C_RST}" "${_msg}" >&2
+    printf "  ${_C_BOLD}${_C_CYN}?${_C_RST} ${_msg}" >&2
     read -r "${_var}" </dev/tty
 }
 
-# ── 旋转进度指示器（后台子 shell，不阻塞主逻辑）
+# ── 现代点阵旋转动画
 spinner_start() {
     local msg="$1"
-    printf "${_C_CYN}[....] %s${_C_RST}\n" "${msg}"
     ( i=0
-      chars='-\|/'
+      # 现代盲文点阵动画字符
+      chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
       while true; do
-          c="${chars:$(( i % 4 )):1}"
-          printf "\r${_C_CYN}[ %s  ]${_C_RST} %s  " "${c}" "${msg}" >&2
-          sleep 0.12; i=$(( i + 1 ))
+          c="${chars:$(( i % 10 )):1}"
+          printf "\r  ${_C_CYN}%s${_C_RST} %s " "${c}" "${msg}" >&2
+          sleep 0.08; i=$(( i + 1 ))
       done
     ) &
     _spinner_pid=$!
@@ -112,11 +113,12 @@ spinner_stop() {
 }
 
 _pause() {
-    printf "${_C_RED}按回车键继续...${_C_RST}" >&2
+    echo ""
+    printf "  ${_C_DIM}按回车键继续...${_C_RST}" >&2
     read -r _dummy </dev/tty || true
 }
 
-_hr() { printf "${_C_PUR}%s${_C_RST}\n" "  ──────────────────────────────────"; }
+_hr() { printf "  ${_C_DIM}──────────────────────────────────────────${_C_RST}\n"; }
 
 # ==============================================================================
 # §4 ── 平台检测层（所有平台判断集中于此，业务函数不直接调用 uname/systemctl）
@@ -1275,7 +1277,7 @@ manage_restart() {
 }
 
 # ==============================================================================
-# §19 ── 主菜单（while true 闭环，所有分支均回到菜单）
+# §19 ── 主菜单（极简大方风格）
 # ==============================================================================
 menu() {
     while true; do
@@ -1284,47 +1286,52 @@ menu() {
         astat=$(check_argo)
         fixed_domain=$(_st_read "${ST_DOMAIN_FIXED}")
 
+        # 状态颜色处理
         [ "${cx}" -eq 0 ] && xcolor="${_C_GRN}" || xcolor="${_C_RED}"
 
+        # 格式化显示内容
         case "${FREEFLOW_MODE}" in
             ws)          ff_disp="WS (path=${FF_PATH})"          ;;
             httpupgrade) ff_disp="HTTPUpgrade (path=${FF_PATH})" ;;
             xhttp)       ff_disp="XHTTP (path=${FF_PATH})"       ;;
-            *)           ff_disp="未启用"                         ;;
+            *)           ff_disp="${_C_DIM}未启用${_C_RST}"       ;;
         esac
 
         if [ "${ARGO_MODE}" = "yes" ]; then
             [ -n "${fixed_domain:-}" ] \
                 && argo_disp="${astat} [${ARGO_PROTOCOL}, 固定: ${fixed_domain}]" \
                 || argo_disp="${astat} [WS, 临时隧道]"
+            # 给运行状态上色
+            argo_disp="${argo_disp/running/${_C_GRN}running${_C_RST}}"
+            argo_disp="${argo_disp/stopped/${_C_RED}stopped${_C_RST}}"
         else
-            argo_disp="未启用"
+            argo_disp="${_C_DIM}未启用${_C_RST}"
         fi
 
         clear; echo ""
-        printf "${_C_BOLD}${_C_PUR}  ════════════════════════════════ ${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}           Xray-2go  v2.0          ${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ════════════════════════════════ ${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ${_C_RST}  Xray:     ${xcolor}%-20s${_C_RST}${_C_PUR}${_C_RST}\n"  "${xstat}"
-        printf "${_C_BOLD}${_C_PUR}  ${_C_RST}  Argo:     %-20s${_C_PUR}${_C_RST}\n"  "${argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ${_C_RST}  FF:       %-20s${_C_PUR}${_C_RST}\n"  "${ff_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ${_C_RST}  重启间隔: ${_C_CYN}%-2s min${_C_RST}               ${_C_PUR}${_C_RST}\n" "${RESTART_INTERVAL}"
-        printf "${_C_BOLD}${_C_PUR}  ════════════════════════════════ ${_C_RST}\n"
-        echo ""
-        printf "  ${_C_GRN}1.${_C_RST} 安装 Xray-2go\n"
+        printf "  ${_C_BOLD}${_C_CYN}Xray-2go 管理面板${_C_RST} ${_C_DIM}v2.0${_C_RST}\n"
+        _hr
+        printf "  %-12s : ${xcolor}%s${_C_RST}\n" "Xray 状态" "${xstat}"
+        printf "  %-12s : %s\n" "Argo 隧道" "${argo_disp}"
+        printf "  %-12s : %s\n" "FreeFlow" "${ff_disp}"
+        printf "  %-12s : ${_C_CYN}%s${_C_RST} 分钟\n" "重启间隔" "${RESTART_INTERVAL}"
+        _hr
+        
+        printf "  ${_C_CYN}1.${_C_RST} 安装 Xray-2go\n"
         printf "  ${_C_RED}2.${_C_RST} 卸载 Xray-2go\n"
-        _hr
-        printf "  ${_C_GRN}3.${_C_RST} Argo 管理\n"
-        printf "  ${_C_GRN}4.${_C_RST} FreeFlow 管理\n"
-        _hr
-        printf "  ${_C_GRN}5.${_C_RST} 查看节点\n"
-        printf "  ${_C_GRN}6.${_C_RST} 修改 UUID\n"
-        printf "  ${_C_GRN}7.${_C_RST} 自动重启管理\n"
-        printf "  ${_C_GRN}8.${_C_RST} 快捷方式/脚本更新\n"
-        _hr
-        printf "  ${_C_RED}0.${_C_RST} 退出\n"
         echo ""
-        prompt "请输入选择 (0-8): " _c
+        printf "  ${_C_CYN}3.${_C_RST} Argo 隧道管理\n"
+        printf "  ${_C_CYN}4.${_C_RST} FreeFlow 管理\n"
+        echo ""
+        printf "  ${_C_CYN}5.${_C_RST} 查看连接节点\n"
+        printf "  ${_C_CYN}6.${_C_RST} 修改节点 UUID\n"
+        printf "  ${_C_CYN}7.${_C_RST} 自动重启管理\n"
+        printf "  ${_C_CYN}8.${_C_RST} 更新本脚本\n"
+        echo ""
+        printf "  ${_C_DIM}0. 退出${_C_RST}\n"
+        _hr
+        
+        prompt "请选择操作 (0-8): " _c
         echo ""
 
         case "${_c:-}" in
@@ -1336,19 +1343,16 @@ menu() {
                     [ "${ARGO_MODE}" = "yes" ] && ask_argo_protocol
                     ask_freeflow_mode
 
-                    # ── 端口前置检查（告警，不阻断）
                     [ "${ARGO_MODE}" = "yes" ] && port_in_use "${ARGO_PORT}" && \
                         log_warn "端口 ${ARGO_PORT} 已被占用，可安装后通过 Argo 管理修改"
                     [ "${FREEFLOW_MODE}" != "none" ] && port_in_use 80 && \
                         log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
 
-                    # ── Debian 12 / BBR 环境自愈
                     check_systemd_resolved
                     check_bbr
 
                     install_core || { log_error "安装失败，请查看以上错误信息"; _pause; continue; }
 
-                    # ── 安装后节点获取流程
                     if [ "${ARGO_MODE}" = "yes" ] && [ "${ARGO_PROTOCOL}" = "xhttp" ]; then
                         echo ""; log_warn "XHTTP 仅支持固定隧道，现在进入配置..."
                         if configure_fixed_tunnel; then
@@ -1360,8 +1364,8 @@ menu() {
 
                     elif [ "${ARGO_MODE}" = "yes" ]; then
                         echo ""
-                        printf "  ${_C_GRN}1.${_C_RST} 临时隧道（WS，自动生成域名）${_C_YLW}[默认]${_C_RST}\n"
-                        printf "  ${_C_GRN}2.${_C_RST} 固定隧道（使用自有 token/json）\n"
+                        printf "  ${_C_CYN}1.${_C_RST} 临时隧道（WS，自动生成域名）${_C_DIM}[默认]${_C_RST}\n"
+                        printf "  ${_C_CYN}2.${_C_RST} 固定隧道（使用自有 token/json）\n"
                         prompt "请选择隧道类型 (1-2，回车默认1): " _tc
                         case "${_tc:-1}" in
                             2)
