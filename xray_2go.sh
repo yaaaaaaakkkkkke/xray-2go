@@ -511,13 +511,13 @@ _urlencode_path() {
 }
 
 _link_argo_ws() {
-    local uuid="$1" domain="$2" cfip="${3:-cdns.doon.eu.org}" cfport="${4:-443}"
+    local uuid="$1" domain="$2" cfip="${3:-cf.tencentapp.cn}" cfport="${4:-443}"
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
         "${uuid}" "${cfip}" "${cfport}" "${domain}" "${domain}"
 }
 
 _link_argo_xhttp() {
-    local uuid="$1" domain="$2" cfip="${3:-cdns.doon.eu.org}" cfport="${4:-443}"
+    local uuid="$1" domain="$2" cfip="${3:-cf.tencentapp.cn}" cfport="${4:-443}"
     printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto#Argo-XHTTP\n' \
         "${uuid}" "${cfip}" "${cfport}" "${domain}" "${domain}"
 }
@@ -544,7 +544,7 @@ build_all_links() {
     local uuid ip
     uuid=$(get_uuid)
     ip=$(get_realip)
-    local cfip="${CFIP:-cdns.doon.eu.org}" cfport="${CFPORT:-443}"
+    local cfip="${CFIP:-cf.tencentapp.cn}" cfport="${CFPORT:-443}"
 
     {
         if [ "${ARGO_MODE}" = "yes" ] && [ -n "${argo_domain:-}" ]; then
