@@ -540,7 +540,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"ws", security:"none",
                             wsSettings:{path:$path}},
@@ -551,7 +551,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"httpupgrade", security:"none",
                             httpupgradeSettings:{path:$path}},
@@ -562,7 +562,7 @@ _gen_inbound_snippet() {
                         --arg uuid  "${_uuid}" \
                         --arg path  "${_ff_path}" \
                         --argjson sniff "${_SNIFF_JSON}" '{
-                        port:80, listen:"::", protocol:"vless",
+                        port:8080, listen:"::", protocol:"vless",
                         settings:{clients:[{id:$uuid}], decryption:"none"},
                         streamSettings:{network:"xhttp", security:"none",
                             xhttpSettings:{host:"", path:$path, mode:"stream-one"}},
@@ -853,13 +853,13 @@ _get_share_links() {
             _penc=$(_urlencode_path "${_path}")
             case "${_ff_proto}" in
                 ws)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
                 httpupgrade)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
                 xhttp)
-                    printf 'vless://%s@%s:80?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                    printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
             esac
         else
@@ -1317,7 +1317,7 @@ ask_argo_protocol() {
 }
 
 ask_freeflow_mode() {
-    echo ""; log_title "FreeFlow（明文 port 80）"
+    echo ""; log_title "FreeFlow（明文 port 8080）"
     printf "  ${_C_GRN}1.${_C_RST} VLESS + WS\n"
     printf "  ${_C_GRN}2.${_C_RST} VLESS + HTTPUpgrade\n"
     printf "  ${_C_GRN}3.${_C_RST} VLESS + XHTTP (stream-one)\n"
@@ -1330,7 +1330,7 @@ ask_freeflow_mode() {
         *) state_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0 ;;
     esac
-    port_in_use 80 && log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+    port_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
     local _p; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) : ;; *) _p="/${_p}" ;; esac
     state_set '.ff.path = $p' --arg p "${_p:-/}"
@@ -1568,8 +1568,8 @@ menu() {
                     [ "$(state_get '.argo.enabled')" = "true" ] && \
                         port_in_use "$(state_get '.argo.port')" && \
                         log_warn "端口 $(state_get '.argo.port') 已被占用，可安装后修改"
-                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 80 && \
-                        log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
+                        log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
 
                     check_systemd_resolved
                     check_bbr
