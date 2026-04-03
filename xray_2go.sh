@@ -216,13 +216,13 @@ preflight_check() {
 #  数据 Schema（默认值）：
 #  {
 #    "uuid":    "<自动生成>",
-#    "argo":   { "enabled": true,  "protocol": "ws",   "port": 8080,
+#    "argo":   { "enabled": true,  "protocol": "ws",   "port": 8888,
 #                "mode": "temp",   "domain": null,     "token": null },
 #    "ff":     { "enabled": false, "protocol": "none", "path": "/" },
 #    "reality":{ "enabled": false, "port": 443, "sni": "www.microsoft.com",
 #                "pbk": null, "pvk": null, "sid": null },
 #    "cron":   0,
-#    "cfip":   "cdns.doon.eu.org",
+#    "cfip":   "cf.tencentapp.cn",
 #    "cfport": "443"
 #  }
 #
@@ -237,13 +237,13 @@ _STATE=""
 # 默认状态模板（jq -n 生成，保证合法 JSON）
 readonly _STATE_DEFAULT='{
   "uuid":    "",
-  "argo":    {"enabled":true,  "protocol":"ws",   "port":8080,
+  "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"temp",   "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
   "reality": {"enabled":false, "port":443, "sni":"www.microsoft.com",
               "pbk":null, "pvk":null, "sid":null},
   "cron":    0,
-  "cfip":    "cdns.doon.eu.org",
+  "cfip":    "cf.tencentapp.cn",
   "cfport":  "443"
 }'
 
