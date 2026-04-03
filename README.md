@@ -4,7 +4,7 @@
 
 ## 支持系统
 
-Debian / Ubuntu / CentOS / Alpine / Fedora / AlmaLinux / Rocky Linux / Amazon Linux
+Debian / Ubuntu / Alpine
 
 ## 使用方法
 
