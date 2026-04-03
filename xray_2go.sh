@@ -4,7 +4,6 @@
 # Architecture : Core Engine  +  Protocol Plugin Registry
 # Platform     : Debian 12 / Ubuntu (primary) · CentOS/RHEL · Alpine (OpenRC)
 # ==============================================================================
-
 set -uo pipefail
 
 # ── §0  SIGNAL / CLEANUP ──────────────────────────────────────────────────────
@@ -38,7 +37,7 @@ readonly UPSTREAM="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/head
 # ── §2  RUNTIME STATE  (所有可变全局变量集中声明) ─────────────────────────────
 ARGO_MODE="yes"     # yes | no
 ARGO_PROTO="ws"     # ws  | xhttp
-ARGO_PORT=8888
+ARGO_PORT=8080
 FF_MODE="none"      # ws | httpupgrade | xhttp | none
 FF_PATH="/"
 FIXED_DOMAIN=""
@@ -221,8 +220,8 @@ preflight_install() {
     # 仅输出告警，不阻断安装（端口占用为非致命场景）
     [[ "$ARGO_MODE" == "yes" ]] && _port_in_use "$ARGO_PORT" && \
         warn "端口 $ARGO_PORT 已被占用，安装后可在 Argo 管理中修改"
-    [[ "$FF_MODE" != "none" ]] && _port_in_use 8080808080808080 && \
-        warn "端口 8080808080808080 已被占用，FreeFlow 可能无法启动"
+    [[ "$FF_MODE" != "none" ]] && _port_in_use 80 && \
+        warn "端口 80 已被占用，FreeFlow 可能无法启动"
     local avail; avail=$(df -k /etc 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
     [[ "$avail" -lt 51200 ]] && warn "磁盘剩余空间不足 50MB，可能影响安装"
     return 0
@@ -308,7 +307,7 @@ _ib_argo_xhttp() {
 _ib_ff_ws() {
     local u; u=$(_get_uuid)
     jq -n --arg u "$u" --arg p "$FF_PATH" --argjson s "$(_sniff)" '{
-        port:8080808080808080, listen:"::", protocol:"vless",
+        port:80, listen:"::", protocol:"vless",
         settings:{clients:[{id:$u}], decryption:"none"},
         streamSettings:{network:"ws", security:"none", wsSettings:{path:$p}},
         sniffing:$s }'
@@ -317,7 +316,7 @@ _ib_ff_ws() {
 _ib_ff_httpupgrade() {
     local u; u=$(_get_uuid)
     jq -n --arg u "$u" --arg p "$FF_PATH" --argjson s "$(_sniff)" '{
-        port:8080808080808080, listen:"::", protocol:"vless",
+        port:80, listen:"::", protocol:"vless",
         settings:{clients:[{id:$u}], decryption:"none"},
         streamSettings:{network:"httpupgrade", security:"none",
             httpupgradeSettings:{path:$p}},
@@ -327,7 +326,7 @@ _ib_ff_httpupgrade() {
 _ib_ff_xhttp() {
     local u; u=$(_get_uuid)
     jq -n --arg u "$u" --arg p "$FF_PATH" --argjson s "$(_sniff)" '{
-        port:8080808080808080, listen:"::", protocol:"vless",
+        port:80, listen:"::", protocol:"vless",
         settings:{clients:[{id:$u}], decryption:"none"},
         streamSettings:{network:"xhttp", security:"none",
             xhttpSettings:{host:"", path:$p, mode:"stream-one"}},
@@ -351,13 +350,13 @@ _lk_ff() {
     local u="$1" ip="$2" pe; pe=$(_urlencode "$FF_PATH")
     case "$FF_MODE" in
         ws)
-            printf 'vless://%s@%s:8080808080808080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+            printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
                 "$u" "$ip" "$ip" "$pe" ;;
         httpupgrade)
-            printf 'vless://%s@%s:8080808080808080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+            printf 'vless://%s@%s:80?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                 "$u" "$ip" "$ip" "$pe" ;;
         xhttp)
-            printf 'vless://%s@%s:8080808080808080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+            printf 'vless://%s@%s:80?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                 "$u" "$ip" "$ip" "$pe" ;;
     esac
 }
@@ -455,7 +454,7 @@ apply_argo_inbound() {
 }
 
 apply_ff_inbound() {
-    _jq_patch "$CONFIG_FILE" 'del(.inbounds[]? | select(.port == 8080808080808080))' || return 1
+    _jq_patch "$CONFIG_FILE" 'del(.inbounds[]? | select(.port == 80))' || return 1
     [[ "$FF_MODE" == "none" ]] && return 0
     local ib; ib=$(_dispatch_ib_ff) || return 1
     _jq_patch "$CONFIG_FILE" '.inbounds += [$ib]' --argjson ib "$ib"
@@ -1032,7 +1031,7 @@ ask_argo_proto() {
 }
 
 ask_ff_mode() {
-    echo ""; title "FreeFlow（明文 port 8080808080808080）"
+    echo ""; title "FreeFlow（明文 port 80）"
     printf "  ${GRN}1.${R} VLESS + WS\n"
     printf "  ${GRN}2.${R} VLESS + HTTPUpgrade\n"
     printf "  ${GRN}3.${R} VLESS + XHTTP (stream-one)\n"
@@ -1044,7 +1043,7 @@ ask_ff_mode() {
     esac
 
     if [[ "$FF_MODE" != "none" ]]; then
-        _port_in_use 8080808080808080 && warn "端口 8080808080808080 已被占用，FreeFlow 可能无法启动"
+        _port_in_use 80 && warn "端口 80 已被占用，FreeFlow 可能无法启动"
         local p; prompt "FreeFlow path（回车默认 /）: " p
         [[ "${p:-/}" == /* ]] && FF_PATH="${p:-/}" || FF_PATH="/${p}"
         info "已选: $FF_MODE（path=$FF_PATH）"
