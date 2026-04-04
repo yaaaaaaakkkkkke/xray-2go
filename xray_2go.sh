@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -uo pipefail
 
 # ====================== 初始化与全局变量 ======================
@@ -186,22 +187,6 @@ get_realip() {
     fi
 }
 
-# @description 轮询 Argo 日志获取临时域名（指数退避，最多约 44s）
-# @return 临时域名字符串，失败返回 1
-get_temp_domain() {
-    local _d _delay=3 _i=1
-    sleep 3
-    while [ "${_i}" -le 6 ]; do
-        _d=$(grep -o 'https://[^[:space:]]*trycloudflare\.com' \
-             "${ARGO_LOG}" 2>/dev/null | head -1 | sed 's|https://||') || true
-        [ -n "${_d:-}" ] && printf '%s' "${_d}" && return 0
-        sleep "${_delay}"
-        _i=$(( _i + 1 ))
-        _delay=$(( _delay < 8 ? _delay * 2 : 8 ))
-    done
-    return 1
-}
-
 # @description URL 编码路径字符串
 # @param $1 原始路径
 # @return 编码后字符串
@@ -330,31 +315,31 @@ _kernel_ge() {
 # --- SSOT 内存状态 ---
 _STATE=""
 
-# state.json Schema（含 SOCKS5 节，向后兼容旧版本）：
+# state.json Schema：
 # {
 #   "uuid":    "<自动生成>",
 #   "argo":    { "enabled":true,  "protocol":"ws",   "port":8888,
-#                "mode":"temp",   "domain":null,      "token":null },
+#                "mode":"fixed",  "domain":null,      "token":null },
 #   "ff":      { "enabled":false, "protocol":"none", "path":"/" },
 #   "reality": { "enabled":false, "port":443, "sni":"addons.mozilla.org",
-#                "pbk":null, "pvk":null, "sid":null },
+#                "network":"tcp", "pbk":null, "pvk":null, "sid":null },
 #   "socks5":  { "enabled":false, "port":18888, "listen":"0.0.0.0",
 #                "auth":"noauth", "user":"", "pass":"" },
 #   "cron":    0,
-#   "cfip":    "cf.tencentapp.cn",
+#   "cfip":    "cdns.doon.eu.org",
 #   "cfport":  "443"
 # }
 readonly _STATE_DEFAULT='{
   "uuid":    "",
   "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
-              "mode":"temp",   "domain":null,      "token":null},
+              "mode":"fixed",  "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
-              "pbk":null, "pvk":null, "sid":null},
+              "network":"tcp", "pbk":null, "pvk":null, "sid":null},
   "socks5":  {"enabled":false, "port":18888, "listen":"0.0.0.0",
               "auth":"noauth", "user":"", "pass":""},
   "cron":    0,
-  "cfip":    "cf.tencentapp.cn",
+  "cfip":    "cdns.doon.eu.org",
   "cfport":  "443"
 }'
 
@@ -399,6 +384,14 @@ _state_ensure_socks5() {
     if [ -z "${_check:-}" ] || [ "${_check}" = "null" ]; then
         state_set '.socks5 = {"enabled":false,"port":18888,"listen":"0.0.0.0",
                               "auth":"noauth","user":"","pass":""}'
+    fi
+}
+
+# @description 确保旧版 state.json 缺少 reality.network 字段时补全默认值（向后兼容）
+_state_ensure_reality_network() {
+    local _check; _check=$(state_get '.reality.network')
+    if [ -z "${_check:-}" ] || [ "${_check}" = "null" ]; then
+        state_set '.reality.network = "tcp"'
     fi
 }
 
@@ -480,8 +473,9 @@ state_init() {
         local _raw; _raw=$(cat "${STATE_FILE}" 2>/dev/null || true)
         if printf '%s' "${_raw}" | jq -e . >/dev/null 2>&1; then
             _STATE="${_raw}"
-            # 补全旧版本缺少的 socks5 节（向后兼容）
+            # 补全旧版本缺少的字段（向后兼容）
             _state_ensure_socks5
+            _state_ensure_reality_network
             _state_ensure_uuid
             return 0
         fi
@@ -654,27 +648,49 @@ _gen_inbound_snippet() {
                 *) log_error "_gen_inbound_snippet ff: 未知协议 ${_ff_proto}"; return 1 ;;
             esac ;;
 
-        # ── Reality（VLESS + TCP + XTLS-Vision）
+        # ── Reality（VLESS + Reality，支持 tcp/xhttp 两种传输方式）
         reality)
-            local _r_port _r_sni _r_pvk _r_sid
+            local _r_port _r_sni _r_pvk _r_sid _r_net
             _r_port=$(state_get '.reality.port')
             _r_sni=$( state_get '.reality.sni')
             _r_pvk=$( state_get '.reality.pvk')
             _r_sid=$( state_get '.reality.sid')
-            jq -n \
-                --argjson port  "${_r_port}" \
-                --arg     uuid  "${_uuid}" \
-                --arg     sni   "${_r_sni}" \
-                --arg     pvk   "${_r_pvk}" \
-                --arg     sid   "${_r_sid}" \
-                --argjson sniff "${_SNIFF_JSON}" '{
-                port:$port, listen:"::", protocol:"vless",
-                settings:{clients:[{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"},
-                streamSettings:{network:"tcp", security:"reality",
-                    realitySettings:{show:false, dest:($sni+":443"), xver:0,
-                        serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]}},
-                sniffing:$sniff
-            }' ;;
+            _r_net=$( state_get '.reality.network')
+            _r_net="${_r_net:-tcp}"
+            case "${_r_net}" in
+                xhttp)
+                    # XHTTP + Reality：无 flow，xhttpSettings path="/"
+                    jq -n \
+                        --argjson port  "${_r_port}" \
+                        --arg     uuid  "${_uuid}" \
+                        --arg     sni   "${_r_sni}" \
+                        --arg     pvk   "${_r_pvk}" \
+                        --arg     sid   "${_r_sid}" \
+                        --argjson sniff "${_SNIFF_JSON}" '{
+                        port:$port, listen:"::", protocol:"vless",
+                        settings:{clients:[{id:$uuid}], decryption:"none"},
+                        streamSettings:{network:"xhttp", security:"reality",
+                            realitySettings:{show:false, dest:($sni+":443"), xver:0,
+                                serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
+                            xhttpSettings:{host:"", path:"/", mode:"auto"}},
+                        sniffing:$sniff
+                    }' ;;
+                *)  # tcp（默认）：xtls-rprx-vision flow
+                    jq -n \
+                        --argjson port  "${_r_port}" \
+                        --arg     uuid  "${_uuid}" \
+                        --arg     sni   "${_r_sni}" \
+                        --arg     pvk   "${_r_pvk}" \
+                        --arg     sid   "${_r_sid}" \
+                        --argjson sniff "${_SNIFF_JSON}" '{
+                        port:$port, listen:"::", protocol:"vless",
+                        settings:{clients:[{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"},
+                        streamSettings:{network:"tcp", security:"reality",
+                            realitySettings:{show:false, dest:($sni+":443"), xver:0,
+                                serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]}},
+                        sniffing:$sniff
+                    }' ;;
+            esac ;;
 
         # ── SOCKS5（noauth 或 password 两种认证模式）
         socks5)
@@ -845,18 +861,26 @@ _get_share_links() {
         fi
     fi
 
-    # ── Reality 链接（VLESS + TCP + XTLS-Vision）
+    # ── Reality 链接（tcp: XTLS-Vision / xhttp: XHTTP+Reality）
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
-        local _r_port _r_sni _r_pbk _r_sid
+        local _r_port _r_sni _r_pbk _r_sid _r_net
         _r_port=$(state_get '.reality.port')
         _r_sni=$( state_get '.reality.sni')
         _r_pbk=$( state_get '.reality.pbk')
         _r_sid=$( state_get '.reality.sid')
+        _r_net=$( state_get '.reality.network')
+        _r_net="${_r_net:-tcp}"
         if [ -n "${_r_pbk:-}" ] && [ "${_r_pbk}" != "null" ]; then
             _ip=$(get_realip)
             if [ -n "${_ip:-}" ]; then
-                printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
-                    "${_uuid}" "${_ip}" "${_r_port}" "${_r_sni}" "${_r_pbk}" "${_r_sid}"
+                case "${_r_net}" in
+                    xhttp)
+                        printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=auto#Reality-XHTTP\n' \
+                            "${_uuid}" "${_ip}" "${_r_port}" "${_r_sni}" "${_r_pbk}" "${_r_sid}" ;;
+                    *)
+                        printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
+                            "${_uuid}" "${_ip}" "${_r_port}" "${_r_sni}" "${_r_pbk}" "${_r_sid}" ;;
+                esac
             else
                 log_warn "无法获取服务器 IP，Reality 节点已跳过"
             fi
@@ -878,25 +902,19 @@ _get_share_links() {
         else
             _s5_host="${_s5_listen}"
         fi
+
         if [ -n "${_s5_host:-}" ]; then
             if [ "${_s5_auth}" = "password" ] \
                 && [ -n "${_s5_user:-}" ] && [ -n "${_s5_pass:-}" ]; then
-                local _auth="${_s5_user}:${_s5_pass}"
-                printf 'socks://%s@%s:%s#SOCKS5-Auth\n' \
-                    "$(_socks5_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
+                printf 'socks5://%s:%s@%s:%s#SOCKS5-Auth\n' \
+                    "${_s5_user}" "${_s5_pass}" "${_s5_host}" "${_s5_port}"
             else
-                printf 'socks://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
+                printf 'socks5://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
             fi
         else
             log_warn "无法获取服务器 IP，SOCKS5 节点已跳过"
         fi
     fi
-}
-
-# @description base64用户名密码
-_socks5_auth_base64() {
-    local _auth="${1}"
-    printf '%s' "${_auth}" | base64 -w 0 | tr -d '='
 }
 
 # @description 彩色打印所有节点链接
@@ -1006,25 +1024,17 @@ _register_tunnel_service() {
     fi
 }
 
-# @description 从 _STATE 派生 cloudflared 启动命令（temp/fixed 两种模式）
+# @description 从 _STATE 派生 cloudflared 固定隧道启动命令
 # @return cloudflared 命令行字符串
 _build_tunnel_cmd() {
-    local _mode; _mode=$(state_get '.argo.mode')
-    local _port; _port=$(state_get '.argo.port')
-    case "${_mode}" in
-        fixed)
-            if [ -f "${WORK_DIR}/tunnel.yml" ]; then
-                printf '%s tunnel --edge-ip-version auto --config %s run' \
-                    "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
-            else
-                local _tok; _tok=$(state_get '.argo.token')
-                printf '%s tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token %s' \
-                    "${ARGO_BIN}" "${_tok}"
-            fi ;;
-        *)  # temp
-            printf '%s tunnel --url http://localhost:%s --no-autoupdate --edge-ip-version auto --protocol http2' \
-                "${ARGO_BIN}" "${_port}" ;;
-    esac
+    if [ -f "${WORK_DIR}/tunnel.yml" ]; then
+        printf '%s tunnel --edge-ip-version auto --config %s run' \
+            "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+    else
+        local _tok; _tok=$(state_get '.argo.token')
+        printf '%s tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token %s' \
+            "${ARGO_BIN}" "${_tok}"
+    fi
 }
 
 # @description 生成 Argo 固定隧道配置 tunnel.yml（ingress 规则从 _STATE 动态构建）
@@ -1203,37 +1213,6 @@ configure_fixed_tunnel() {
     log_ok "固定隧道已配置 (${_argo_proto}, domain=${_domain})"
 }
 
-# @description 重置为临时隧道（清理 tunnel.yml/json，强制回 ws 协议）
-reset_temp_tunnel() {
-    state_set '.argo.mode = "temp" | .argo.domain = null | .argo.token = null' || return 1
-    rm -f "${WORK_DIR}/tunnel.yml" "${WORK_DIR}/tunnel.json"
-    _register_tunnel_service
-    _svc_daemon_reload
-    state_set '.argo.protocol = "ws"' || return 1
-    config_commit || return 1
-    state_persist || log_warn "state.json 写入失败"
-    log_ok "已切换至临时隧道"
-}
-
-# @description 刷新临时域名（重启 tunnel → 轮询日志 → 更新 _STATE）
-refresh_temp_domain() {
-    [ "$(state_get '.argo.enabled')" = "true" ] || { log_warn "未启用 Argo"; return 1; }
-    [ "$(state_get '.argo.protocol')" = "ws" ]  || { log_error "XHTTP 不支持临时隧道"; return 1; }
-    [ "$(state_get '.argo.mode')" = "temp" ]    || { log_warn "当前为固定隧道，无需刷新"; return 1; }
-
-    rm -f "${ARGO_LOG}"
-    log_step "重启隧道并等待新域名（最多约 44s）..."
-    _svc_manager restart tunnel || return 1
-
-    local _d
-    _d=$(get_temp_domain) || { log_warn "未能获取临时域名，请检查网络"; return 1; }
-    log_ok "ArgoDomain: ${_d}"
-
-    state_set '.argo.domain = $d' --arg d "${_d}" || return 1
-    state_persist || log_warn "state.json 写入失败"
-    print_nodes
-}
-
 # --- UUID / 端口管理 ---
 
 # @description 修改 UUID（SSOT 工作流：state_set → config_commit → persist → print）
@@ -1367,9 +1346,6 @@ check_argo() {
     _svc_manager status tunnel && { printf 'running'; return 0; } || { printf 'stopped'; return 1; }
 }
 
-# @description 判断当前是否为固定隧道（读 _STATE）
-is_fixed_tunnel() { [ "$(state_get '.argo.mode')" = "fixed" ]; }
-
 # ====================== 用户交互与菜单 ======================
 
 # --- 安装向导询问函数 ---
@@ -1389,15 +1365,13 @@ ask_argo_mode() {
 
 # @description 安装向导：询问 Argo 传输协议（WS / XHTTP）
 ask_argo_protocol() {
-    echo ""; log_title "Argo 传输协议"
-    printf "  ${_C_GRN}1.${_C_RST} WS（临时+固定均支持）${_C_YLW}[默认]${_C_RST}\n"
-    printf "  ${_C_GRN}2.${_C_RST} XHTTP（auto 模式，仅固定隧道）\n"
+    echo ""; log_title "Argo 传输协议（固定隧道）"
+    printf "  ${_C_GRN}1.${_C_RST} WS（WebSocket）${_C_YLW}[默认]${_C_RST}\n"
+    printf "  ${_C_GRN}2.${_C_RST} XHTTP（auto 模式）\n"
     local _c; prompt "请选择 (1-2，回车默认1): " _c
     case "${_c:-1}" in
-        2)
-            state_set '.argo.protocol = "xhttp"'
-            log_warn "XHTTP 不支持临时隧道！安装后将进入固定隧道配置。" ;;
-        *) state_set '.argo.protocol = "ws"' ;;
+        2) state_set '.argo.protocol = "xhttp"' ;;
+        *) state_set '.argo.protocol = "ws"'    ;;
     esac
     log_info "已选协议: $(state_get '.argo.protocol')"; echo ""
 }
@@ -1424,9 +1398,9 @@ ask_freeflow_mode() {
     log_info "已选: $(state_get '.ff.protocol')（path=${_p:-/}）"; echo ""
 }
 
-# @description 安装向导：询问 Reality 配置（端口/SNI）
+# @description 安装向导：询问 Reality 配置（端口/SNI/传输方式）
 ask_reality_mode() {
-    echo ""; log_title "VLESS + Reality Vision（TCP 直连，独立端口，无需 Argo）"
+    echo ""; log_title "VLESS + Reality（TCP 直连，独立端口，无需 Argo）"
     printf "  ${_C_GRN}1.${_C_RST} 启用 Reality\n"
     printf "  ${_C_GRN}2.${_C_RST} 不启用 ${_C_YLW}[默认]${_C_RST}\n"
     local _c; prompt "请选择 (1-2，回车默认2): " _c
@@ -1452,7 +1426,7 @@ ask_reality_mode() {
         && log_warn "端口 $(state_get '.reality.port') 已被占用，可安装后通过 Reality 管理修改"
 
     local _default_sni; _default_sni=$(state_get '.reality.sni')
-    log_info "SNI 建议：addons.mozilla.org / www.microsoft.com"
+    log_info "SNI 建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
     local _sni; prompt "伪装 SNI 域名（回车默认 ${_default_sni}）: " _sni
     if [ -n "${_sni:-}" ]; then
         printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
@@ -1460,7 +1434,17 @@ ask_reality_mode() {
             || log_warn "SNI 格式不合法，使用默认值 ${_default_sni}"
     fi
 
-    log_info "Reality 配置完成 — 端口: $(state_get '.reality.port')  SNI: $(state_get '.reality.sni')"
+    # 传输方式
+    echo ""
+    printf "  ${_C_GRN}1.${_C_RST} TCP + XTLS-Vision（xtls-rprx-vision flow）${_C_YLW}[默认]${_C_RST}\n"
+    printf "  ${_C_GRN}2.${_C_RST} XHTTP + Reality（auto 模式，无 flow）\n"
+    local _nc; prompt "请选择传输方式 (1-2，回车默认1): " _nc
+    case "${_nc:-1}" in
+        2) state_set '.reality.network = "xhttp"'; log_info "已选：XHTTP + Reality" ;;
+        *) state_set '.reality.network = "tcp"';   log_info "已选：TCP + XTLS-Vision" ;;
+    esac
+
+    log_info "Reality 配置完成 — 端口: $(state_get '.reality.port')  SNI: $(state_get '.reality.sni')  传输: $(state_get '.reality.network')"
     log_info "密钥对将在安装时由 xray x25519 自动生成"
     echo ""
 }
@@ -1525,32 +1509,32 @@ ask_socks5_mode() {
 
 # --- 管理子菜单 ---
 
-# @description Argo 隧道管理子菜单
+# @description Argo 隧道管理子菜单（仅固定隧道）
 manage_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || { log_warn "未启用 Argo"; sleep 1; return; }
     [ -f "${ARGO_BIN}" ]                         || { log_warn "Argo 未安装"; sleep 1; return; }
 
     while true; do
-        local _astat _domain _type_disp _proto _port
+        local _astat _domain _proto _port
         _astat=$(check_argo)
         _domain=$(state_get '.argo.domain')
         _proto=$(state_get '.argo.protocol')
         _port=$(state_get '.argo.port')
-        is_fixed_tunnel && [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] \
-            && _type_disp="固定 (${_proto}, ${_domain})" \
-            || _type_disp="临时 (WS)"
 
-        clear; echo ""; log_title "══ Argo 隧道管理 ══"
+        clear; echo ""; log_title "══ Argo 固定隧道管理 ══"
         printf "  状态: ${_C_GRN}%s${_C_RST}  协议: ${_C_CYN}%s${_C_RST}  端口: ${_C_YLW}%s${_C_RST}\n" \
             "${_astat}" "${_proto}" "${_port}"
-        printf "  类型: %s\n" "${_type_disp}"; _hr
+        if [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ]; then
+            printf "  域名: ${_C_GRN}%s${_C_RST}\n" "${_domain}"
+        else
+            printf "  域名: ${_C_YLW}未配置（请选项 1 配置固定隧道）${_C_RST}\n"
+        fi
+        _hr
         printf "  ${_C_GRN}1.${_C_RST} 添加/更新固定隧道\n"
-        printf "  ${_C_GRN}2.${_C_RST} 切换协议 (WS ↔ XHTTP，仅固定隧道)\n"
-        printf "  ${_C_GRN}3.${_C_RST} 切换回临时隧道 (WS)\n"
-        printf "  ${_C_GRN}4.${_C_RST} 刷新临时域名\n"
-        printf "  ${_C_GRN}5.${_C_RST} 修改回源端口 (当前: ${_C_YLW}${_port}${_C_RST})\n"
-        printf "  ${_C_GRN}6.${_C_RST} 启动隧道\n"
-        printf "  ${_C_GRN}7.${_C_RST} 停止隧道\n"
+        printf "  ${_C_GRN}2.${_C_RST} 切换协议 (WS ↔ XHTTP)\n"
+        printf "  ${_C_GRN}3.${_C_RST} 修改回源端口 (当前: ${_C_YLW}${_port}${_C_RST})\n"
+        printf "  ${_C_GRN}4.${_C_RST} 启动隧道\n"
+        printf "  ${_C_GRN}5.${_C_RST} 停止隧道\n"
         printf "  ${_C_PUR}0.${_C_RST} 返回主菜单\n"; _hr
         local _c; prompt "请输入选择: " _c
 
@@ -1566,7 +1550,6 @@ manage_argo() {
                 esac
                 configure_fixed_tunnel && print_nodes || log_error "固定隧道配置失败" ;;
             2)
-                is_fixed_tunnel || { log_warn "当前为临时隧道，请先配置固定隧道"; _pause; continue; }
                 local _new_proto
                 [ "${_proto}" = "ws" ] && _new_proto="xhttp" || _new_proto="ws"
                 state_set '.argo.protocol = $p' --arg p "${_new_proto}" || { _pause; continue; }
@@ -1576,24 +1559,9 @@ manage_argo() {
                     log_error "切换失败，回滚"
                     state_set '.argo.protocol = $p' --arg p "${_proto}"
                 fi ;;
-            3)
-                [ "$(state_get '.argo.protocol')" = "xhttp" ] && \
-                    { log_error "请先切换协议为 WS 再切回临时隧道"; _pause; continue; }
-                reset_temp_tunnel || { _pause; continue; }
-                _svc_manager restart tunnel || { _pause; continue; }
-                log_step "等待临时域名（最多约 44s）..."
-                local _td; _td=$(get_temp_domain) || _td=""
-                if [ -n "${_td:-}" ]; then
-                    state_set '.argo.domain = $d' --arg d "${_td}" || true
-                    state_persist || true
-                    log_ok "ArgoDomain: ${_td}"; print_nodes
-                else
-                    log_warn "未能获取临时域名，可从 [4. 刷新临时域名] 重试"
-                fi ;;
-            4) refresh_temp_domain ;;
-            5) manage_port ;;
-            6) _svc_manager start  tunnel && log_ok "隧道已启动" || log_error "启动失败" ;;
-            7) _svc_manager stop   tunnel && log_ok "隧道已停止" || log_error "停止失败" ;;
+            3) manage_port ;;
+            4) _svc_manager start  tunnel && log_ok "隧道已启动" || log_error "启动失败" ;;
+            5) _svc_manager stop   tunnel && log_ok "隧道已停止" || log_error "停止失败" ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1658,24 +1626,26 @@ manage_reality() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
 
     while true; do
-        local _r_en _r_port _r_sni _r_pbk _r_pvk _r_sid _pbk_disp
+        local _r_en _r_port _r_sni _r_pbk _r_pvk _r_sid _r_net _pbk_disp
         _r_en=$(  state_get '.reality.enabled')
         _r_port=$(state_get '.reality.port')
         _r_sni=$( state_get '.reality.sni')
         _r_pbk=$( state_get '.reality.pbk')
         _r_pvk=$( state_get '.reality.pvk')
         _r_sid=$( state_get '.reality.sid')
+        _r_net=$( state_get '.reality.network')
+        _r_net="${_r_net:-tcp}"
 
-        # 公钥仅显示前 16 字符
         _pbk_disp="未生成"
         [ -n "${_r_pbk:-}" ] && [ "${_r_pbk}" != "null" ] \
             && _pbk_disp="${_r_pbk:0:16}...（完整见节点链接）"
 
-        clear; echo ""; log_title "══ Reality 管理 (VLESS+TCP+XTLS-Vision) ══"
+        clear; echo ""; log_title "══ Reality 管理 (VLESS+Reality) ══"
         [ "${_r_en}" = "true" ] \
             && printf "  状态: ${_C_GRN}已启用${_C_RST}\n" \
             || printf "  状态: ${_C_YLW}未启用${_C_RST}\n"
-        printf "  端口: ${_C_YLW}%s${_C_RST}  SNI: ${_C_CYN}%s${_C_RST}\n" "${_r_port}" "${_r_sni}"
+        printf "  端口: ${_C_YLW}%s${_C_RST}  SNI: ${_C_CYN}%s${_C_RST}  传输: ${_C_GRN}%s${_C_RST}\n" \
+            "${_r_port}" "${_r_sni}" "${_r_net}"
         printf "  公钥: %s\n" "${_pbk_disp}"
         [ -n "${_r_sid:-}" ] && [ "${_r_sid}" != "null" ] \
             && printf "  ShortId: ${_C_CYN}%s${_C_RST}\n" "${_r_sid}"
@@ -1684,8 +1654,9 @@ manage_reality() {
         printf "  ${_C_RED}2.${_C_RST} 禁用 Reality\n"
         printf "  ${_C_GRN}3.${_C_RST} 修改监听端口（当前: ${_C_YLW}${_r_port}${_C_RST}）\n"
         printf "  ${_C_GRN}4.${_C_RST} 修改伪装 SNI（当前: ${_C_CYN}${_r_sni}${_C_RST}）\n"
-        printf "  ${_C_GRN}5.${_C_RST} 重新生成密钥对 (x25519 + shortId)\n"
-        printf "  ${_C_GRN}6.${_C_RST} 查看节点链接\n"
+        printf "  ${_C_GRN}5.${_C_RST} 切换传输方式（当前: ${_C_GRN}${_r_net}${_C_RST}，TCP ↔ XHTTP）\n"
+        printf "  ${_C_GRN}6.${_C_RST} 重新生成密钥对 (x25519 + shortId)\n"
+        printf "  ${_C_GRN}7.${_C_RST} 查看节点链接\n"
         printf "  ${_C_PUR}0.${_C_RST} 返回主菜单\n"; _hr
         local _c; prompt "请输入选择: " _c
 
@@ -1724,7 +1695,7 @@ manage_reality() {
                 state_persist  || log_warn "state.json 写入失败"
                 log_ok "Reality 端口已更新: ${_p}"; print_nodes ;;
             4)
-                log_info "建议：addons.mozilla.org / www.microsoft.com"
+                log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
                 local _sni; prompt "新 SNI（回车保持 ${_r_sni}）: " _sni
                 if [ -n "${_sni:-}" ]; then
                     printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
@@ -1735,6 +1706,14 @@ manage_reality() {
                     log_ok "SNI 已更新: ${_sni}"; print_nodes
                 fi ;;
             5)
+                # 切换传输方式 tcp ↔ xhttp
+                local _new_net
+                [ "${_r_net}" = "tcp" ] && _new_net="xhttp" || _new_net="tcp"
+                state_set '.reality.network = $n' --arg n "${_new_net}" || { _pause; continue; }
+                config_commit  || { _pause; continue; }
+                state_persist  || log_warn "state.json 写入失败"
+                log_ok "传输方式已切换: ${_new_net}"; print_nodes ;;
+            6)
                 [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪，请先安装"; _pause; continue; }
                 log_step "重新生成 x25519 密钥对..."
                 _gen_reality_keypair || { _pause; continue; }
@@ -1743,7 +1722,7 @@ manage_reality() {
                 state_persist || log_warn "state.json 写入失败"
                 log_ok "密钥对已更新"
                 [ "$(state_get '.reality.enabled')" = "true" ] && print_nodes ;;
-            6) print_nodes ;;
+            7) print_nodes ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1908,17 +1887,19 @@ menu() {
         _domain=$(state_get '.argo.domain')
         if [ "$(state_get '.argo.enabled')" = "true" ]; then
             [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] \
-                && _argo_disp="${_astat} [$(state_get '.argo.protocol'), 固定: ${_domain}]" \
-                || _argo_disp="${_astat} [WS, 临时隧道]"
+                && _argo_disp="${_astat} [$(state_get '.argo.protocol'), ${_domain}]" \
+                || _argo_disp="${_astat} [未配置域名]"
         else
             _argo_disp="未启用"
         fi
 
         local _r_en _r_disp
         _r_en=$(state_get '.reality.enabled')
-        [ "${_r_en}" = "true" ] \
-            && _r_disp="已启用 (port=$(state_get '.reality.port'), sni=$(state_get '.reality.sni'))" \
-            || _r_disp="未启用"
+        if [ "${_r_en}" = "true" ]; then
+            _r_disp="已启用 (port=$(state_get '.reality.port'), $(state_get '.reality.network'), sni=$(state_get '.reality.sni'))"
+        else
+            _r_disp="未启用"
+        fi
 
         local _s5_en _s5_disp
         _s5_en=$(state_get '.socks5.enabled')
@@ -1931,7 +1912,7 @@ menu() {
         # 绘制状态面板
         clear; echo ""
         printf "${_C_BOLD}${_C_PUR}  ╔══════════════════════════════════════════╗${_C_RST}\n"
-        printf "${_C_BOLD}${_C_PUR}  ║        Xray-2go  v4.0  SSOT/AC           ║${_C_RST}\n"
+        printf "${_C_BOLD}${_C_PUR}  ║              Xray-2go  SSOT/AC           ║${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ╠══════════════════════════════════════════╣${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-30s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-30s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
@@ -1953,7 +1934,7 @@ menu() {
         printf "  ${_C_GRN}9.${_C_RST} 自动重启管理\n"
         printf "  ${_C_GRN}s.${_C_RST} 快捷方式/脚本更新\n"; _hr
         printf "  ${_C_RED}0.${_C_RST} 退出\n\n"
-        local _c; prompt "请输入选择 (0-9/s): " _c; echo ""
+        local _c; prompt "请输入选择 (0-9/A): " _c; echo ""
 
         case "${_c:-}" in
             1)
@@ -1992,43 +1973,10 @@ menu() {
 
                     install_core || { log_error "安装失败"; _pause; continue; }
 
-                    # 安装后 Argo 域名获取流程
-                    if [ "$(state_get '.argo.protocol')" = "xhttp" ]; then
-                        log_warn "XHTTP 仅支持固定隧道，现在进入配置..."
+                    # 安装后进入固定隧道配置
+                    if [ "$(state_get '.argo.enabled')" = "true" ]; then
                         configure_fixed_tunnel \
                             || log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"
-
-                    elif [ "$(state_get '.argo.enabled')" = "true" ]; then
-                        echo ""
-                        printf "  ${_C_GRN}1.${_C_RST} 临时隧道 (WS, 自动生成域名) ${_C_YLW}[默认]${_C_RST}\n"
-                        printf "  ${_C_GRN}2.${_C_RST} 固定隧道 (自有 token/json)\n"
-                        local _tc; prompt "请选择隧道类型 (回车默认1): " _tc
-                        case "${_tc:-1}" in
-                            2)
-                                if ! configure_fixed_tunnel; then
-                                    log_warn "固定隧道配置失败，回退临时隧道"
-                                    _svc_manager restart tunnel || true
-                                    local _td; _td=$(get_temp_domain) || _td=""
-                                    if [ -n "${_td:-}" ]; then
-                                        state_set '.argo.domain = $d' --arg d "${_td}" || true
-                                        state_persist || true
-                                        log_ok "ArgoDomain: ${_td}"
-                                    else
-                                        log_warn "未能获取临时域名，可从 [3→4] 刷新"
-                                    fi
-                                fi ;;
-                            *)
-                                log_step "等待 Argo 临时域名（最多约 44s）..."
-                                _svc_manager restart tunnel || true
-                                local _td; _td=$(get_temp_domain) || _td=""
-                                if [ -n "${_td:-}" ]; then
-                                    state_set '.argo.domain = $d' --arg d "${_td}" || true
-                                    state_persist || true
-                                    log_ok "ArgoDomain: ${_td}"
-                                else
-                                    log_warn "未能获取临时域名，可从 [3→4] 刷新"
-                                fi ;;
-                        esac
                     fi
                     print_nodes
                 fi ;;
