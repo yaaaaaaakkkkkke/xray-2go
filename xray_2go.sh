@@ -260,14 +260,14 @@ fix_time_sync() {
 # Schema:
 # {
 #   "uuid":    "",
-#   "argo":    {"enabled":true,  "protocol":"ws", "port":8080,
+#   "argo":    {"enabled":true,  "protocol":"ws", "port":8888,
 #               "mode":"fixed",  "domain":null,   "token":null},
 #   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
 #   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
 #               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
 #   "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
 #   "cron":    0,
-#   "cfip":    "cdns.doon.eu.org",
+#   "cfip":    "cf.tencentapp.cn",
 #   "cfport":  "443"
 # }
 # ==============================================================================
@@ -275,14 +275,14 @@ _STATE=""
 
 readonly _STATE_DEFAULT='{
   "uuid":    "",
-  "argo":    {"enabled":true,  "protocol":"ws",   "port":8080,
+  "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"fixed",  "domain":null,      "token":null},
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
   "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
   "cron":    0,
-  "cfip":    "cdns.doon.eu.org",
+  "cfip":    "cf.tencentapp.cn",
   "cfport":  "443"
 }'
 
@@ -484,7 +484,7 @@ _gen_inbound_snippet() {
                     sniffing:$sniff}' ;;
         esac ;;
 
-    # ── FreeFlow（明文 port 80：WS / HTTPUpgrade / XHTTP）
+    # ── FreeFlow（明文 port 8080：WS / HTTPUpgrade / XHTTP）
     ff)
         local _proto _path
         _proto=$(state_get '.ff.protocol'); _path=$(state_get '.ff.path')
@@ -492,7 +492,7 @@ _gen_inbound_snippet() {
             ws)
                 jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                        --argjson sniff "${_SNIFF}" '{
-                    port:80, listen:"::", protocol:"vless",
+                    port:8080, listen:"::", protocol:"vless",
                     settings:{clients:[{id:$uuid}], decryption:"none"},
                     streamSettings:{network:"ws", security:"none",
                         wsSettings:{path:$path}},
@@ -500,7 +500,7 @@ _gen_inbound_snippet() {
             httpupgrade)
                 jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                        --argjson sniff "${_SNIFF}" '{
-                    port:80, listen:"::", protocol:"vless",
+                    port:8080, listen:"::", protocol:"vless",
                     settings:{clients:[{id:$uuid}], decryption:"none"},
                     streamSettings:{network:"httpupgrade", security:"none",
                         httpupgradeSettings:{path:$path}},
@@ -508,7 +508,7 @@ _gen_inbound_snippet() {
             xhttp)
                 jq -n --arg uuid "${_uuid}" --arg path "${_path}" \
                        --argjson sniff "${_SNIFF}" '{
-                    port:80, listen:"::", protocol:"vless",
+                    port:8080, listen:"::", protocol:"vless",
                     settings:{clients:[{id:$uuid}], decryption:"none"},
                     streamSettings:{network:"xhttp", security:"none",
                         xhttpSettings:{host:"", path:$path, mode:"stream-one"}},
@@ -657,7 +657,7 @@ _get_share_links() {
         fi
     fi
 
-    # FreeFlow（明文直连 port 80）
+    # FreeFlow（明文直连 port 8080）
     local _ffp; _ffp=$(state_get '.ff.protocol')
     if [ "$(state_get '.ff.enabled')" = "true" ] && [ "${_ffp}" != "none" ]; then
         _ip=$(get_realip)
@@ -665,11 +665,11 @@ _get_share_links() {
             local _path _penc
             _path=$(state_get '.ff.path'); _penc=$(urlencode_path "${_path}")
             case "${_ffp}" in
-                ws)          printf 'vless://%s@%s:80?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
+                ws)          printf 'vless://%s@%s:8080?encryption=none&security=none&type=ws&host=%s&path=%s#FreeFlow-WS\n' \
                                  "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-                httpupgrade) printf 'vless://%s@%s:80?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
+                httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                                  "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-                xhttp)       printf 'vless://%s@%s:80?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
+                xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                                  "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
             esac
         else
@@ -1118,7 +1118,7 @@ ask_argo_protocol() {
 }
 
 ask_freeflow_mode() {
-    echo ""; log_title "FreeFlow（明文 port 80）"
+    echo ""; log_title "FreeFlow（明文 port 8080）"
     printf "  ${C_GRN}1.${C_RST} VLESS + WS\n"
     printf "  ${C_GRN}2.${C_RST} VLESS + HTTPUpgrade\n"
     printf "  ${C_GRN}3.${C_RST} VLESS + XHTTP (stream-one)\n"
@@ -1131,7 +1131,7 @@ ask_freeflow_mode() {
         *) state_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0;;
     esac
-    port_in_use 80 && log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+    port_in_use 8080 && log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
     local _p; prompt "FreeFlow path（回车默认 /）: " _p
     case "${_p:-/}" in /*) :;; *) _p="/${_p}";; esac
     state_set '.ff.path = $p' --arg p "${_p:-/}"
@@ -1586,8 +1586,8 @@ menu() {
                     [ "$(state_get '.argo.enabled')" = "true" ] && \
                         port_in_use "$(state_get '.argo.port')" && \
                         log_warn "Argo 端口 $(state_get '.argo.port') 已被占用，可安装后修改"
-                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 80 && \
-                        log_warn "端口 80 已被占用，FreeFlow 可能无法启动"
+                    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
+                        log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
                     if [ "$(state_get '.reality.enabled')" = "true" ]; then
                         local _rp _ap
                         _rp=$(state_get '.reality.port'); _ap=$(state_get '.argo.port')
