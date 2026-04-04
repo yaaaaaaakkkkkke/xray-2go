@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# xray-2go v4.0
-# 重构说明:
-#   新增:
-#     - SOCKS5 inbound 支持（state.json 新增 socks5 配置节）
-#     - _gen_inbound_snippet 扩展 socks5 类型（noauth/password 双模式）
-#     - socks5:// share link 实时生成（零持久化）
-#     - ask_socks5_mode 安装向导、manage_socks5 子菜单
-#     - 主菜单新增选项 A（SOCKS5 管理），状态栏新增 SOCKS5 行
-#   重构:
-#     - 按固定分区注释重新组织代码结构，提升可读性
-#     - 所有重要函数添加 @description/@param/@return 注释
-#     - 统一 4 空格缩进、snake_case 命名、一致空行
-#     - state.json schema 扩展向后兼容（旧 state 加载后自动补全缺失 socks5 节）
-#     - 所有原有外部行为（UI/trap/spinner/命令接口）保持不变
-# ==============================================================================
+
 set -uo pipefail
 
 # ====================== 初始化与全局变量 ======================
@@ -354,7 +339,7 @@ _STATE=""
 #   "ff":      { "enabled":false, "protocol":"none", "path":"/" },
 #   "reality": { "enabled":false, "port":443, "sni":"addons.mozilla.org",
 #                "pbk":null, "pvk":null, "sid":null },
-#   "socks5":  { "enabled":false, "port":108080, "listen":"0.0.0.0",
+#   "socks5":  { "enabled":false, "port":18888, "listen":"0.0.0.0",
 #                "auth":"noauth", "user":"", "pass":"" },
 #   "cron":    0,
 #   "cfip":    "cf.tencentapp.cn",
@@ -367,7 +352,7 @@ readonly _STATE_DEFAULT='{
   "ff":      {"enabled":false, "protocol":"none", "path":"/"},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "pbk":null, "pvk":null, "sid":null},
-  "socks5":  {"enabled":false, "port":108080, "listen":"0.0.0.0",
+  "socks5":  {"enabled":false, "port":18888, "listen":"0.0.0.0",
               "auth":"noauth", "user":"", "pass":""},
   "cron":    0,
   "cfip":    "cf.tencentapp.cn",
@@ -413,7 +398,7 @@ _state_ensure_uuid() {
 _state_ensure_socks5() {
     local _check; _check=$(state_get '.socks5')
     if [ -z "${_check:-}" ] || [ "${_check}" = "null" ]; then
-        state_set '.socks5 = {"enabled":false,"port":108080,"listen":"0.0.0.0",
+        state_set '.socks5 = {"enabled":false,"port":18888,"listen":"0.0.0.0",
                               "auth":"noauth","user":"","pass":""}'
     fi
 }
@@ -1945,9 +1930,9 @@ menu() {
         printf "${_C_BOLD}${_C_PUR}  ╠══════════════════════════════════════════╣${_C_RST}\n"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Xray    : ${_xcolor}%-30s${_C_RST}${_C_PUR} ${_C_RST}\n"  "${_xstat}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Argo    : %-30s${_C_PUR} ${_C_RST}\n"  "${_argo_disp}"
-        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF      : %-30s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Reality : %-30s${_C_PUR} ${_C_RST}\n"  "${_r_disp}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  SOCKS5  : %-30s${_C_PUR} ${_C_RST}\n"  "${_s5_disp}"
+        printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  FF      : %-30s${_C_PUR} ${_C_RST}\n"  "${_ff_disp}"
         printf "${_C_BOLD}${_C_PUR}  ║${_C_RST}  Cron    : ${_C_CYN}%-2s min${_C_RST}                          ${_C_PUR} ${_C_RST}\n" "$(state_get '.cron')"
         printf "${_C_BOLD}${_C_PUR}  ╚══════════════════════════════════════════╝${_C_RST}\n\n"
 
@@ -1955,9 +1940,9 @@ menu() {
         printf "  ${_C_GRN}1.${_C_RST} 安装 Xray-2go\n"
         printf "  ${_C_RED}2.${_C_RST} 卸载 Xray-2go\n"; _hr
         printf "  ${_C_GRN}3.${_C_RST} Argo 管理\n"
-        printf "  ${_C_GRN}4.${_C_RST} FreeFlow 管理\n"
-        printf "  ${_C_GRN}5.${_C_RST} Reality 管理\n"
-        printf "  ${_C_GRN}6.${_C_RST} SOCKS5 管理\n"; _hr
+        printf "  ${_C_GRN}4.${_C_RST} Reality 管理\n"
+        printf "  ${_C_GRN}5.${_C_RST} SOCKS5 管理\n"; _hr
+        printf "  ${_C_GRN}6.${_C_RST} FreeFlow 管理\n"
         printf "  ${_C_GRN}7.${_C_RST} 查看节点\n"
         printf "  ${_C_GRN}8.${_C_RST} 修改 UUID\n"
         printf "  ${_C_GRN}9.${_C_RST} 自动重启管理\n"
@@ -2044,15 +2029,15 @@ menu() {
                 fi ;;
             2) uninstall_all ;;
             3) manage_argo ;;
-            4) manage_freeflow ;;
-            5) manage_reality ;;
-            6) manage_socks5 ;;
+            4) manage_reality ;;
+            5) manage_socks5 ;;
+            6) manage_freeflow ;;
             7) [ "${_cx}" -eq 0 ] && print_nodes || log_warn "Xray-2go 未安装或未运行" ;;
             8) [ -f "${CONFIG_FILE}" ] && manage_uuid || log_warn "请先安装 Xray-2go" ;;
             9) manage_restart ;;
             s) install_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9 或 A" ;;
+            *) log_error "无效选项，请输入 0-9 或 s" ;;
         esac
         _pause
     done
