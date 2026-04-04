@@ -797,13 +797,6 @@ config_commit() {
     fi
 }
 
-# @description base64编码
-# @return 经过base64编码后内容
-_socks5_auth_base64() {
-    local _auth="${1}"
-    printf '%s' "${_auth}" | base64 -w 0 | tr -d '='
-}
-
 # @description 从 _STATE 实时生成所有节点 share links（零文件 I/O）
 # @return 每行一个链接，stdout 输出
 _get_share_links() {
@@ -890,11 +883,10 @@ _get_share_links() {
         if [ -n "${_s5_host:-}" ]; then
             if [ "${_s5_auth}" = "password" ] \
                 && [ -n "${_s5_user:-}" ] && [ -n "${_s5_pass:-}" ]; then
-                local _auth="${_s5_user}:${_s5_pass}"
-                printf 'socks5://%s@%s:%s#SOCKS5-Auth\n' \
-                    "$(_socks5_auth_base64 "${_auth}")" "${_s5_host}" "${_s5_port}"
+                printf 'socks://%s:%s@%s:%s#SOCKS5-Auth\n' \
+                    "${_s5_user}" "${_s5_pass}" "${_s5_host}" "${_s5_port}"
             else
-                printf 'socks5://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
+                printf 'socks://%s:%s#SOCKS5-NoAuth\n' "${_s5_host}" "${_s5_port}"
             fi
         else
             log_warn "无法获取服务器 IP，SOCKS5 节点已跳过"
@@ -1727,7 +1719,7 @@ manage_reality() {
                 state_persist  || log_warn "state.json 写入失败"
                 log_ok "Reality 端口已更新: ${_p}"; print_nodes ;;
             4)
-                log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
+                log_info "建议：addons.mozilla.org / www.microsoft.com"
                 local _sni; prompt "新 SNI（回车保持 ${_r_sni}）: " _sni
                 if [ -n "${_sni:-}" ]; then
                     printf '%s' "${_sni}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
