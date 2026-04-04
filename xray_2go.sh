@@ -1948,7 +1948,7 @@ menu() {
         printf "  ${_C_GRN}9.${_C_RST} 自动重启管理\n"
         printf "  ${_C_GRN}s.${_C_RST} 快捷方式/脚本更新\n"; _hr
         printf "  ${_C_RED}0.${_C_RST} 退出\n\n"
-        local _c; prompt "请输入选择 (0-9/A): " _c; echo ""
+        local _c; prompt "请输入选择 (0-9/s): " _c; echo ""
 
         case "${_c:-}" in
             1)
