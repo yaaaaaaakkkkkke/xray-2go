@@ -674,7 +674,7 @@ protocol_vltcp() {
     _uuid=$(state_get '.uuid')
     jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" '{
         port:$port, listen:$listen, protocol:"vless",
-        settings:{clients:[{id:$uuid}], decryption:"none"}}'
+        settings:{clients:[{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"}}'
 }
 
 # ==============================================================================
@@ -750,7 +750,7 @@ link_vltcp() {
     [ "${_listen}" = "0.0.0.0" ] || [ "${_listen}" = "::" ] \
         && _vhost=$(get_realip) || _vhost="${_listen}"
     if [ -z "${_vhost:-}" ]; then log_warn "无法获取服务器 IP，VLESS-TCP 节点已跳过"; return 0; fi
-    printf 'vless://%s@%s:%s?type=tcp&security=none#VLESS-TCP\n' \
+    printf 'vless://%s@%s:%s?type=tcp&flow=xtls-rprx-vision&security=none#VLESS-TCP\n' \
         "${_uuid}" "${_vhost}" "$(state_get '.vltcp.port')"
 }
 
