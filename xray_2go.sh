@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v7.2
+# xray-2go v8.0
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-# v7.2 变更（相对 v7.1）：
-#   [稳定] _detect_init: /proc/1/comm 验证 init，增加容器环境检测
-#   [稳定] pkg_require: 捕获安装 exit code，apt-get cache 时效检测
-#   [稳定] download_xray: binary 三重验证(存在+可执行+可运行)，多镜像 fallback
-#   [稳定] exec_install_core: 安装失败自动清理本次新下载的 binary
-#   [稳定] config_synthesize: 端口+listen 冲突运行时检测
-#   [稳定] 防火墙模块全部重写: firewall_sync 幂等同步，_fw_open/-_close 去重
-#   [稳定] _cleanup_exit: TTY 检测后再调用 tput cnorm
-#   [稳定] _tpl_xray_openrc: 添加 output_log/error_log，修复日志静默丢弃
-#   [维护] _PROTOCOL_ORDER: string→array，修复 SC2086，for 循环改用 [@]
-#   [维护] get_realip: 进程内缓存，4 个 link 函数不再重复请求
-#   [维护] state 事务: begin/commit/rollback，安装向导全程事务保护
+# v8.0 变更（相对 v7.2）：隔离运行模型重构
+#   [架构] 所有资源重命名至 xray2go 命名空间，与系统 xray 完全隔离
+#   [架构] 删除接管逻辑、遗留清理逻辑、state 事务快照
+#   [新增] _xray_health_check: 三重验证（存在+可执行+version+-test）
+#   [新增] _detect_existing_xray: 仅提示，不干预
+#   [新增] _check_port_conflicts: 冲突时自动随机分配新端口
+#   [新增] _verify_service_health: 启动后轮询验证+自动打印失败日志
+#   [新增] _force_cleanup_firewall: 仅清理本脚本托管端口
+#   [新增] _cleanup_processes: 仅清理本脚本 pid 文件
+#   [修改] exec_uninstall: 只删除本脚本资源，不触碰系统 xray
+#   [修改] download_xray: 使用 _xray_health_check 替代简单 version 判断
+#   [修改] exec_install_core: 移除接管逻辑，冲突仅提示后隔离启动
 # ==============================================================================
 set -uo pipefail
 
@@ -25,9 +25,9 @@ set -uo pipefail
     || { printf '\033[1;91m[ERR ] 需要 bash 4.0 或更高版本\033[0m\n' >&2; exit 1; }
 
 # ==============================================================================
-# §1  全局常量
+# §1  全局常量（xray2go 隔离命名空间）
 # ==============================================================================
-readonly WORK_DIR="/etc/xray"
+readonly WORK_DIR="/etc/xray2go"
 readonly XRAY_BIN="${WORK_DIR}/xray"
 readonly ARGO_BIN="${WORK_DIR}/argo"
 readonly CONFIG_FILE="${WORK_DIR}/config.json"
@@ -38,6 +38,8 @@ readonly SELF_DEST="/usr/local/bin/xray2go"
 readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
 readonly _STATE_SCHEMA_VERSION=2
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
+readonly _SVC_XRAY="xray2go"
+readonly _SVC_TUNNEL="tunnel2go"
 
 # 可按需增减镜像（顺序即优先级）
 readonly _XRAY_MIRRORS=(
@@ -58,7 +60,6 @@ trap '_cleanup_int'  INT TERM
 _cleanup_exit() {
     [ "${_SPINNER_PID}" -ne 0 ] && kill "${_SPINNER_PID}" 2>/dev/null || true
     [ -n "${_TMP_DIR:-}" ]      && rm -rf "${_TMP_DIR}"   2>/dev/null || true
-    # 仅在 TTY 环境下恢复光标，避免非交互场景产生 tput 错误
     [ -t 1 ] && tput cnorm 2>/dev/null || true
 }
 
@@ -122,8 +123,6 @@ spinner_stop() {
 
 # ==============================================================================
 # §4  CORE — 平台检测
-# 通过 /proc/1/comm 验证 systemd 确实是 PID 1，防止 Alpine 上 systemd 包存在但
-# 未作 init 时被误判。增加容器环境检测，提前给出服务管理受限警告。
 # ==============================================================================
 _INIT_SYS=""
 _ARCH_CF=""
@@ -163,8 +162,6 @@ detect_arch() {
 
 # ==============================================================================
 # §5  CORE — 工具函数
-# pkg_require: 捕获包管理器 exit code；apt-get 按 cache 时效决定是否 update
-# get_realip:  进程内缓存，同一运行周期只发起一次 HTTP 请求
 # ==============================================================================
 check_root() { [ "${EUID:-$(id -u)}" -eq 0 ] || die "请在 root 下运行脚本"; }
 
@@ -256,15 +253,9 @@ _kernel_ge() {
 }
 
 # ==============================================================================
-# §5a CORE — 防火墙模块（全部重写）
-#
-# 设计原则：
-#   _fw_open  : iptables -C 检查后再 -I，幂等
-#   _fw_close : 循环 -D 直到规则不存在，清除全部重复规则
-#   firewall_sync: 计算期望端口集合 diff .fw_ports 记录，自动增删
-#                  端口变更、协议禁用后旧规则自动清理，多次运行无副作用
+# §5a CORE — 防火墙模块
+# 仅管理本脚本托管的端口，记录于 ${_FW_PORTS_FILE}
 # ==============================================================================
-
 _fw_read_managed() {
     grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
 }
@@ -358,7 +349,140 @@ firewall_sync() {
 }
 
 # ==============================================================================
-# §5b CORE — Argo 隧道健康检查（v7.1 保留）
+# §5b CORE — 隔离运行辅助函数
+# ==============================================================================
+
+# 仅检测系统是否存在 xray，返回 1 表示存在，0 表示干净
+# 不做任何修改，仅供提示使用
+_detect_existing_xray() {
+    local _found=0
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl list-unit-files 2>/dev/null \
+            | grep -qiE '^xray[^2]' && _found=1
+    fi
+    [ -f /etc/init.d/xray ] && _found=1
+    local _wx; _wx=$(command -v xray 2>/dev/null || true)
+    [ -n "${_wx:-}" ] && _found=1
+    pgrep -x xray >/dev/null 2>&1 && _found=1
+    return "${_found}"
+}
+
+# 三重验证：文件存在 + 可执行 + version 通过 + -test 最小配置通过
+_xray_health_check() {
+    local _bin="${1:-${XRAY_BIN}}"
+    [ -f "${_bin}" ]  || { log_warn "xray 文件不存在: ${_bin}";          return 1; }
+    [ -x "${_bin}" ]  || { log_warn "xray 不可执行: ${_bin}";            return 1; }
+    "${_bin}" version >/dev/null 2>&1 \
+              || { log_warn "xray version 命令失败，二进制可能已损坏";    return 1; }
+    local _tc; _tc=$(_tmp_file "xray_hc_XXXXXX.json") || return 1
+    printf '{"log":{"loglevel":"none"},"inbounds":[],"outbounds":[{"protocol":"freedom"}]}\n' \
+        > "${_tc}"
+    "${_bin}" -test -c "${_tc}" >/dev/null 2>&1
+    local _rc=$?
+    rm -f "${_tc}" 2>/dev/null || true
+    [ "${_rc}" -ne 0 ] && { log_warn "xray -test 失败（二进制可能损坏）"; return 1; }
+    return 0
+}
+
+# 安装前端口冲突检测，冲突时自动随机分配（幂等）
+_check_port_conflicts() {
+    log_step "检测端口冲突..."
+
+    _safe_random_port() {
+        local _i=0 _p
+        while true; do
+            _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
+                 || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
+            _i=$(( _i + 1 ))
+            port_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
+            [ "${_i}" -gt 30 ] && { log_error "无法在 10000-60000 中找到空闲端口"; return 1; }
+        done
+    }
+
+    local _path _cur _new
+    for _path in '.argo.port' '.reality.port' '.vltcp.port'; do
+        case "${_path}" in
+            '.argo.port')    [ "$(state_get '.argo.enabled')"    = "true" ] || continue ;;
+            '.reality.port') [ "$(state_get '.reality.enabled')" = "true" ] || continue ;;
+            '.vltcp.port')   [ "$(state_get '.vltcp.enabled')"   = "true" ] || continue ;;
+        esac
+        _cur=$(state_get "${_path}")
+        if port_in_use "${_cur}"; then
+            _new=$(_safe_random_port) || return 1
+            state_set "${_path} = (\$p|tonumber)" --arg p "${_new}" || return 1
+            log_ok "端口 ${_cur} 已占用，自动分配: ${_new}"
+        fi
+    done
+
+    if [ "$(state_get '.ff.enabled')" = "true" ] && \
+       [ "$(state_get '.ff.protocol')" != "none" ] && \
+       port_in_use 8080; then
+        log_warn "FreeFlow 端口 8080 已被占用（固定端口），安装后该协议可能无法正常使用"
+    fi
+    return 0
+}
+
+# 仅清理本脚本生成的 pid 文件，不杀任何进程
+_cleanup_processes() {
+    rm -f "${WORK_DIR}/xray.pid" \
+          /var/run/xray2go.pid   \
+          /var/run/tunnel2go.pid 2>/dev/null || true
+}
+
+# 仅清理本脚本托管的防火墙端口，来源：.fw_ports + state.json
+_force_cleanup_firewall() {
+    log_step "清理 xray2go 托管防火墙规则..."
+    local _ports="" _p
+
+    [ -f "${_FW_PORTS_FILE}" ] && \
+        _ports=$(grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null || true)
+
+    if [ -f "${STATE_FILE}" ]; then
+        for _p in \
+            "$(state_get '.argo.port'    2>/dev/null || true)" \
+            "$(state_get '.reality.port' 2>/dev/null || true)" \
+            "$(state_get '.vltcp.port'   2>/dev/null || true)"; do
+            case "${_p:-}" in ''|null|*[!0-9]*) continue;; esac
+            _ports=$(printf '%s\n%s' "${_ports}" "${_p}")
+        done
+    fi
+
+    local _uniq
+    _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
+    for _p in ${_uniq}; do _fw_close "${_p}" tcp 2>/dev/null || true; done
+    rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
+    log_ok "防火墙规则清理完成"
+}
+
+# 启动后轮询验证服务真实就绪，失败时自动输出日志
+_verify_service_health() {
+    local _svc="${1:-${_SVC_XRAY}}" _max="${2:-8}"
+    log_step "验证服务 ${_svc} 就绪（最长 ${_max}s）..."
+    local _i=0
+    while [ "${_i}" -lt "${_max}" ]; do
+        sleep 1; _i=$(( _i + 1 ))
+        exec_svc status "${_svc}" >/dev/null 2>&1 && {
+            log_ok "${_svc} 运行正常 (${_i}s 内就绪)"; return 0
+        }
+    done
+    log_error "${_svc} 启动失败（等待 ${_max}s 后仍未就绪）"
+    if is_systemd; then
+        log_error "── journalctl 最近 20 行 ──"
+        journalctl -u "${_svc}" --no-pager -n 20 2>/dev/null >&2 || true
+        log_error "── systemctl status ──"
+        systemctl status "${_svc}" --no-pager -l 2>/dev/null >&2 || true
+    else
+        local _errlog="${WORK_DIR}/log/error.log"
+        [ -f "${_errlog}" ] && {
+            log_error "── ${_errlog} 最近 20 行 ──"
+            tail -n 20 "${_errlog}" >&2
+        }
+    fi
+    return 1
+}
+
+# ==============================================================================
+# §5c CORE — Argo 隧道健康检查
 # ==============================================================================
 check_argo_health() {
     local _domain; _domain=$(state_get '.argo.domain')
@@ -414,10 +538,9 @@ fix_time_sync() {
 }
 
 # ==============================================================================
-# §7  STATE — 核心操作
+# §7  STATE — 核心操作（无事务快照）
 # ==============================================================================
 _STATE=""
-_STATE_SNAPSHOT=""
 
 readonly _STATE_DEFAULT='{
   "_schema": 2,
@@ -459,14 +582,6 @@ state_persist() {
     mv "${_t}" "${STATE_FILE}"
 }
 
-# 事务机制：安装向导使用 begin/commit/rollback 保护 _STATE 不被脏写
-state_begin_txn()    { _STATE_SNAPSHOT="${_STATE}"; }
-state_commit_txn()   { _STATE_SNAPSHOT=""; state_persist || log_warn "state.json 写入失败"; }
-state_rollback_txn() {
-    [ -n "${_STATE_SNAPSHOT:-}" ] && { _STATE="${_STATE_SNAPSHOT}"; log_info "状态已回滚"; }
-    _STATE_SNAPSHOT=""
-}
-
 # ==============================================================================
 # §8  STATE — 默认值补全与 Schema 迁移
 # ==============================================================================
@@ -495,6 +610,7 @@ state_version() {
 
 # ==============================================================================
 # §9  STATE — 初始化与遗留文件迁移
+# 迁移仅读取 WORK_DIR（/etc/xray2go）内的历史文件，不读取系统 /etc/xray
 # ==============================================================================
 _state_migrate_legacy() {
     local _r
@@ -608,8 +724,6 @@ _gen_reality_sid() {
 
 # ==============================================================================
 # §11 PROTOCOL — 注册表
-# _PROTOCOL_ORDER 改为 bash array，for 循环使用 "${_PROTOCOL_ORDER[@]}"
-# 新增协议只需末尾追加数组元素，无需修改其他逻辑
 # ==============================================================================
 declare -A PROTOCOL_REGISTRY
 declare -A LINK_REGISTRY
@@ -787,8 +901,7 @@ link_vltcp() {
 }
 
 # ==============================================================================
-# §14 CONFIG — 配置合成
-# 端口+listen 冲突检测：相同 listen:port 组合被多个协议使用时跳过后者并报错
+# §14 CONFIG — 配置合成（端口+listen 冲突检测）
 # ==============================================================================
 config_synthesize() {
     local _ibs="[]" _ib _name _fn _used_keys=""
@@ -849,8 +962,7 @@ print_nodes() {
 }
 
 # ==============================================================================
-# §16 RUNTIME — 服务管理
-# _tpl_xray_openrc: 增加 output_log/error_log，修复 OpenRC 日志静默丢弃
+# §16 RUNTIME — 服务管理（使用 _SVC_XRAY / _SVC_TUNNEL 命名空间）
 # ==============================================================================
 _SYSD_DIRTY=0
 
@@ -887,43 +999,46 @@ _svc_write() {
     printf '%s' "${_content}" > "${_dest}"; return 1
 }
 
+# Service 模板 — 均使用 xray2go 命名
 _tpl_xray_systemd() {
-    printf '[Unit]\nDescription=Xray Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n' \
+    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n' \
         "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
 _tpl_tunnel_systemd() {
-    printf '[Unit]\nDescription=Cloudflare Tunnel\nAfter=network.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=/bin/sh -c '"'"'%s >> %s 2>&1'"'"'\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
+    printf '[Unit]\nDescription=Cloudflare Tunnel2go\nAfter=network.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nExecStart=/bin/sh -c '"'"'%s >> %s 2>&1'"'"'\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' \
         "$1" "${ARGO_LOG}"
 }
 
 _tpl_xray_openrc() {
-    mkdir -p /var/log/xray 2>/dev/null || true
-    printf '#!/sbin/openrc-run\ndescription="Xray service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="/var/log/xray/xray.log"\nerror_log="/var/log/xray/error.log"\npidfile="/var/run/xray.pid"\n' \
-        "${XRAY_BIN}" "${CONFIG_FILE}"
+    mkdir -p "${WORK_DIR}/log" 2>/dev/null || true
+    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="%s/log/xray.log"\nerror_log="%s/log/error.log"\npidfile="/var/run/xray2go.pid"\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}" "${WORK_DIR}" "${WORK_DIR}"
 }
 
 _tpl_tunnel_openrc() {
-    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel"\ncommand="/bin/sh"\ncommand_args="-c '"'"'%s >> %s 2>&1'"'"'"\ncommand_background=true\npidfile="/var/run/tunnel.pid"\n' \
+    printf '#!/sbin/openrc-run\ndescription="Cloudflare Tunnel2go"\ncommand="/bin/sh"\ncommand_args="-c '"'"'%s >> %s 2>&1'"'"'"\ncommand_background=true\npidfile="/var/run/tunnel2go.pid"\n' \
         "$1" "${ARGO_LOG}"
 }
 
 apply_xray_service() {
     if is_systemd; then
-        _svc_write "/etc/systemd/system/xray.service" "$(_tpl_xray_systemd)" || _SYSD_DIRTY=1
+        _svc_write "/etc/systemd/system/${_SVC_XRAY}.service" "$(_tpl_xray_systemd)" \
+            || _SYSD_DIRTY=1
     else
-        _svc_write "/etc/init.d/xray" "$(_tpl_xray_openrc)" || chmod +x /etc/init.d/xray
+        local _f="/etc/init.d/${_SVC_XRAY}"
+        _svc_write "${_f}" "$(_tpl_xray_openrc)" || chmod +x "${_f}"
     fi
 }
 
 apply_tunnel_service() {
     local _cmd; _cmd=$(_build_tunnel_cmd)
     if is_systemd; then
-        _svc_write "/etc/systemd/system/tunnel.service" "$(_tpl_tunnel_systemd "${_cmd}")" \
-            || _SYSD_DIRTY=1
+        _svc_write "/etc/systemd/system/${_SVC_TUNNEL}.service" \
+            "$(_tpl_tunnel_systemd "${_cmd}")" || _SYSD_DIRTY=1
     else
-        _svc_write "/etc/init.d/tunnel" "$(_tpl_tunnel_openrc "${_cmd}")" \
-            || chmod +x /etc/init.d/tunnel
+        local _f="/etc/init.d/${_SVC_TUNNEL}"
+        _svc_write "${_f}" "$(_tpl_tunnel_openrc "${_cmd}")" || chmod +x "${_f}"
     fi
 }
 
@@ -950,12 +1065,8 @@ _gen_argo_config() {
 }
 
 # ==============================================================================
-# §18 RUNTIME — 下载（全部重写）
-# _xray_latest_tag: GitHub API（与文件 CDN 不同域，独立信任链）
-# _download_with_fallback: 多镜像依次尝试
-# download_xray: 三重验证现有 binary（存在+可执行+可运行），失败清理残留
+# §18 RUNTIME — 下载
 # ==============================================================================
-
 _xray_latest_tag() {
     curl -sfL --max-time 10 \
         "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
@@ -983,18 +1094,20 @@ _download_with_fallback() {
 
 download_xray() {
     detect_arch
-    if [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
-       "${XRAY_BIN}" version >/dev/null 2>&1; then
+
+    # 三重健康检查：通过则跳过下载
+    if _xray_health_check "${XRAY_BIN}" 2>/dev/null; then
         local _cur
         _cur=$("${XRAY_BIN}" version 2>/dev/null | head -1 | \
                grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        log_info "xray 已存在 (v${_cur:-unknown})，跳过下载"
+        log_info "xray 已存在且健康 (v${_cur:-unknown})，跳过下载"
         return 0
     fi
+    log_info "xray 健康检查未通过，重新下载..."
     rm -f "${XRAY_BIN}" 2>/dev/null || true
 
     local _tag; _tag=$(_xray_latest_tag)
-    [ -z "${_tag:-}" ] && { log_warn "无法获取版本号，使用 latest 重定向"; _tag="latest"; }
+    [ -z "${_tag:-}" ] && { log_warn "无法获取版本号，使用 latest"; _tag="latest"; }
 
     local _zip_name="Xray-linux-${_ARCH_XRAY}.zip"
     local _z; _z=$(_tmp_file "xray_XXXXXX.zip") || return 1
@@ -1026,6 +1139,11 @@ download_xray() {
         || { log_error "解压失败"; return 1; }
     [ -f "${XRAY_BIN}" ] || { log_error "解压后未找到 xray 二进制"; return 1; }
     chmod +x "${XRAY_BIN}"
+
+    # 安装后再次完整健康检查，拦截"假正常二进制"
+    _xray_health_check "${XRAY_BIN}" \
+        || { log_error "新下载的 xray 健康检查失败，已清除"; rm -f "${XRAY_BIN}"; return 1; }
+
     log_ok "Xray 安装完成 ($("${XRAY_BIN}" version 2>/dev/null | head -1 | awk '{print $2}'))"
 }
 
@@ -1075,30 +1193,47 @@ apply_config() {
     mv "${_t}" "${CONFIG_FILE}" || { log_error "config 写入失败"; return 1; }
     log_ok "config.json 已原子更新"
 
-    if exec_svc status xray >/dev/null 2>&1; then
-        exec_svc restart xray || { log_error "xray 重启失败"; return 1; }
-        log_ok "xray 已重启"
+    if exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1; then
+        exec_svc restart "${_SVC_XRAY}" || { log_error "xray2go 重启失败"; return 1; }
+        log_ok "xray2go 已重启"
     fi
 }
 
 # ==============================================================================
 # §20 RUNTIME — 安装与卸载
-# exec_install_core: 记录安装前 binary 状态，失败时清理本次新下载的文件
-# exec_uninstall: 先同步防火墙清理托管端口，再删除 WORK_DIR
 # ==============================================================================
 _INSTALL_XRAY_WAS_PRESENT=0
 _INSTALL_ARGO_WAS_PRESENT=0
 
+# 安装失败时的文件级回滚（不干预系统 xray）
 _exec_install_cleanup() {
-    log_warn "安装中断，清理本次新下载的文件..."
-    [ "${_INSTALL_XRAY_WAS_PRESENT}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
-    [ "${_INSTALL_ARGO_WAS_PRESENT}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
+    log_warn "安装中断，回滚本次新建文件..."
+    [ "${_INSTALL_XRAY_WAS_PRESENT}" -eq 0 ] && rm -f "${XRAY_BIN}"  2>/dev/null || true
+    [ "${_INSTALL_ARGO_WAS_PRESENT}" -eq 0 ] && rm -f "${ARGO_BIN}"  2>/dev/null || true
+    rm -f "${CONFIG_FILE}" 2>/dev/null || true
+    if is_systemd; then
+        rm -f /etc/systemd/system/${_SVC_XRAY}.service   2>/dev/null || true
+        rm -f /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    else
+        rm -f /etc/init.d/${_SVC_XRAY}   2>/dev/null || true
+        rm -f /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
+    fi
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v7.2 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.0 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
+
+    # 仅提示，绝不干预系统 xray
+    if _detect_existing_xray; then
+        log_warn "检测到系统已存在 xray 相关组件"
+        log_warn "本脚本将以完全隔离模式运行（服务名: ${_SVC_XRAY}，目录: ${WORK_DIR}）"
+    fi
+
+    # 端口冲突自动随机分配，不修改已有端口
+    _check_port_conflicts || { log_error "端口冲突无法解决，安装中止"; return 1; }
 
     [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
         _INSTALL_XRAY_WAS_PRESENT=1 || _INSTALL_XRAY_WAS_PRESENT=0
@@ -1121,58 +1256,82 @@ exec_install_core() {
     [ "$(state_get '.argo.enabled')" = "true" ] && apply_tunnel_service
     exec_svc_reload
 
-    if is_openrc; then
+    is_openrc && {
         printf '0 0\n' > /proc/sys/net/ipv4/ping_group_range 2>/dev/null || true
         sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts 2>/dev/null || true
         sed -i '2s/.*/::1         localhost/'  /etc/hosts 2>/dev/null || true
-    fi
+    }
 
     fix_time_sync
-    firewall_sync   # 幂等防火墙同步
+    firewall_sync
 
     log_step "启动服务..."
-    exec_svc enable xray
-    exec_svc start  xray   || { log_error "xray 启动失败"; return 1; }
-    log_ok "xray 已启动"
+    exec_svc enable "${_SVC_XRAY}"
+    exec_svc start  "${_SVC_XRAY}" \
+        || { log_error "启动命令失败"; _exec_install_cleanup; return 1; }
+
+    # 轮询验证，失败自动打印日志并回滚
+    if ! _verify_service_health "${_SVC_XRAY}" 8; then
+        log_error "${_SVC_XRAY} 未正常运行，安装回滚"
+        exec_svc stop "${_SVC_XRAY}" 2>/dev/null || true
+        _exec_install_cleanup
+        return 1
+    fi
 
     if [ "$(state_get '.argo.enabled')" = "true" ]; then
-        exec_svc enable tunnel
-        exec_svc start  tunnel || { log_error "tunnel 启动失败"; return 1; }
-        log_ok "tunnel 已启动"
+        exec_svc enable "${_SVC_TUNNEL}"
+        exec_svc start  "${_SVC_TUNNEL}" \
+            || { log_error "tunnel 启动失败（不影响 xray）"; }
+        log_ok "${_SVC_TUNNEL} 已启动"
     fi
 
     state_persist || log_warn "state.json 写入失败（不影响运行）"
     log_ok "══ 安装完成 ══"
 }
 
+# 卸载：只删除本脚本资源，绝不触碰系统 xray
 exec_uninstall() {
-    local _a; prompt "确定要卸载 xray-2go？(y/N): " _a
+    local _a; prompt "确定要卸载 xray2go？(y/N): " _a
     case "${_a:-n}" in y|Y) :;; *) log_info "已取消"; return;; esac
-    log_step "卸载中..."
+    log_step "卸载中（仅清理 xray2go 自身资源）..."
 
-    # 清理防火墙规则（依赖 state，必须在 rm -rf WORK_DIR 前执行）
-    if [ -f "${STATE_FILE}" ]; then
-        log_step "清理防火墙规则..."
-        local _managed; _managed=$(_fw_read_managed)
-        local _p
-        for _p in ${_managed}; do _fw_close "${_p}" tcp; done
-        rm -f "${_FW_PORTS_FILE}" 2>/dev/null || true
-    fi
-
-    exec_remove_auto_restart
-    for _s in xray tunnel; do
+    # 停止并禁用本脚本的服务
+    for _s in "${_SVC_XRAY}" "${_SVC_TUNNEL}"; do
         exec_svc stop    "${_s}" 2>/dev/null || true
         exec_svc disable "${_s}" 2>/dev/null || true
     done
+
+    # 清理本脚本托管的防火墙端口（在删目录前执行）
+    _force_cleanup_firewall
+
+    # 清理 cron（仅清理本脚本标记的条目）
+    exec_remove_auto_restart
+
+    # 清理本脚本的 pid 文件
+    _cleanup_processes
+
+    # 删除本脚本的 service 文件
     if is_systemd; then
-        rm -f /etc/systemd/system/xray.service /etc/systemd/system/tunnel.service
+        rm -f /etc/systemd/system/${_SVC_XRAY}.service   2>/dev/null || true
+        rm -f /etc/systemd/system/${_SVC_TUNNEL}.service 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
     else
-        rm -f /etc/init.d/xray /etc/init.d/tunnel
+        rm -f /etc/init.d/${_SVC_XRAY}   2>/dev/null || true
+        rm -f /etc/init.d/${_SVC_TUNNEL} 2>/dev/null || true
     fi
-    rm -rf "${WORK_DIR}"
-    rm -f  "${SHORTCUT}" "${SELF_DEST}" "${SELF_DEST}.bak"
-    log_ok "Xray-2go 卸载完成"
+
+    # 删除工作目录（含所有配置/状态/二进制）
+    if [ -d "${WORK_DIR}" ]; then
+        rm -rf "${WORK_DIR}" 2>/dev/null || true
+        [ -d "${WORK_DIR}" ] && \
+            log_warn "${WORK_DIR} 未能完全删除，请手动执行: rm -rf ${WORK_DIR}" || \
+            log_ok "${WORK_DIR} 已清除"
+    fi
+
+    # 删除快捷方式与脚本本体
+    rm -f "${SHORTCUT}" "${SELF_DEST}" "${SELF_DEST}.bak" 2>/dev/null || true
+
+    log_ok "xray2go 卸载完成，系统无残留"
 }
 
 # ==============================================================================
@@ -1218,10 +1377,10 @@ apply_fixed_tunnel() {
 
     apply_tunnel_service
     exec_svc_reload
-    exec_svc enable tunnel 2>/dev/null || true
+    exec_svc enable "${_SVC_TUNNEL}" 2>/dev/null || true
     apply_config  || return 1
     state_persist || log_warn "state.json 写入失败"
-    exec_svc restart tunnel || { log_error "tunnel 重启失败"; return 1; }
+    exec_svc restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
     check_argo_health || true
 }
@@ -1259,13 +1418,13 @@ exec_update_argo_port() {
     state_set '.argo.port = ($p|tonumber)' --arg p "${_p}" || return 1
     apply_config || return 1
     apply_tunnel_service; exec_svc_reload
-    exec_svc restart tunnel || log_warn "tunnel 重启失败，请手动重启"
+    exec_svc restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
     state_persist || log_warn "state.json 写入失败"
     log_ok "回源端口已更新: ${_p}"; print_nodes
 }
 
 # ==============================================================================
-# §23 RUNTIME — Cron 自动重启
+# §23 RUNTIME — Cron 自动重启（标记改为 #xray2go-restart）
 # ==============================================================================
 _cron_available() {
     command -v crontab >/dev/null 2>&1 || return 1
@@ -1298,19 +1457,22 @@ ensure_cron() {
 exec_setup_auto_restart() {
     local _iv; _iv=$(state_get '.cron')
     ensure_cron || return 1
-    local _cmd; is_openrc && _cmd="rc-service xray restart" || _cmd="systemctl restart xray"
+    local _cmd
+    is_openrc \
+        && _cmd="rc-service ${_SVC_XRAY} restart" \
+        || _cmd="systemctl restart ${_SVC_XRAY}"
     local _t; _t=$(_tmp_file "cron_XXXXXX") || return 1
-    { crontab -l 2>/dev/null | grep -v '#xray-restart'
-      printf '*/%s * * * * %s >/dev/null 2>&1 #xray-restart\n' "${_iv}" "${_cmd}"
+    { crontab -l 2>/dev/null | grep -v '#xray2go-restart'
+      printf '*/%s * * * * %s >/dev/null 2>&1 #xray2go-restart\n' "${_iv}" "${_cmd}"
     } > "${_t}"
     crontab "${_t}" || { log_error "crontab 写入失败"; return 1; }
-    log_ok "已设置每 ${_iv} 分钟自动重启 xray"
+    log_ok "已设置每 ${_iv} 分钟自动重启 ${_SVC_XRAY}"
 }
 
 exec_remove_auto_restart() {
     command -v crontab >/dev/null 2>&1 || return 0
     local _t; _t=$(_tmp_file "cron_XXXXXX") || return 0
-    crontab -l 2>/dev/null | grep -v '#xray-restart' > "${_t}" || true
+    crontab -l 2>/dev/null | grep -v '#xray2go-restart' > "${_t}" || true
     crontab "${_t}" 2>/dev/null || true
 }
 
@@ -1335,13 +1497,17 @@ exec_install_shortcut() {
 # ==============================================================================
 check_xray() {
     [ -f "${XRAY_BIN}" ] || { printf 'not installed'; return 2; }
-    exec_svc status xray && { printf 'running'; return 0; } || { printf 'stopped'; return 1; }
+    exec_svc status "${_SVC_XRAY}" \
+        && { printf 'running'; return 0; } \
+        || { printf 'stopped'; return 1; }
 }
 
 check_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || { printf 'disabled'; return 3; }
     [ -f "${ARGO_BIN}" ]                         || { printf 'not installed'; return 2; }
-    exec_svc status tunnel && { printf 'running'; return 0; } || { printf 'stopped'; return 1; }
+    exec_svc status "${_SVC_TUNNEL}" \
+        && { printf 'running'; return 0; } \
+        || { printf 'stopped'; return 1; }
 }
 
 # ==============================================================================
@@ -1411,7 +1577,7 @@ ask_reality_mode() {
         esac
     fi
     port_in_use "$(state_get '.reality.port')" && \
-        log_warn "端口 $(state_get '.reality.port') 已被占用，可安装后修改"
+        log_warn "端口 $(state_get '.reality.port') 已被占用，安装时将自动更换"
     local _ds; _ds=$(state_get '.reality.sni')
     log_info "SNI 建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
     local _sni; prompt "伪装 SNI（回车默认 ${_ds}）: " _sni
@@ -1452,7 +1618,7 @@ ask_vltcp_mode() {
         esac
     fi
     port_in_use "$(state_get '.vltcp.port')" && \
-        log_warn "端口 $(state_get '.vltcp.port') 已被占用，可安装后修改"
+        log_warn "端口 $(state_get '.vltcp.port') 已被占用，安装时将自动更换"
     local _dl; _dl=$(state_get '.vltcp.listen')
     local _vl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl
     [ -n "${_vl:-}" ] && state_set '.vltcp.listen = $l' --arg l "${_vl}"
@@ -1462,7 +1628,6 @@ ask_vltcp_mode() {
 
 # ==============================================================================
 # §27 CLI — 管理子菜单
-# manage_reality / manage_vltcp: open_firewall_port → firewall_sync
 # ==============================================================================
 _input_port() {
     local _jq_path="$1" _p
@@ -1526,8 +1691,8 @@ manage_argo() {
                     state_set '.argo.protocol = $p' --arg p "${_proto}"
                 fi ;;
             3) exec_update_argo_port ;;
-            4) exec_svc start  tunnel && log_ok "隧道已启动" || log_error "启动失败" ;;
-            5) exec_svc stop   tunnel && log_ok "隧道已停止" || log_error "停止失败" ;;
+            4) exec_svc start  "${_SVC_TUNNEL}" && log_ok "隧道已启动" || log_error "启动失败" ;;
+            5) exec_svc stop   "${_SVC_TUNNEL}" && log_ok "隧道已停止" || log_error "停止失败" ;;
             6) check_argo_health || true ;;
             0) return ;;
             *) log_error "无效选项" ;;
@@ -1755,7 +1920,6 @@ manage_restart() {
 
 # ==============================================================================
 # §28 CLI — 主菜单
-# _menu_do_install 使用 state 事务保护，安装失败后 _STATE 回滚至向导启动前
 # ==============================================================================
 _menu_collect_status() {
     local _xs _cx
@@ -1783,7 +1947,8 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║           Xray-2go  v7.2  SSOT/AC        ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        Xray-2go  v8.0  隔离运行模型      ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        工作目录: /etc/xray2go             ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
@@ -1807,11 +1972,8 @@ _menu_render() {
 
 _menu_do_install() {
     if [ "${_MENU_CX}" -eq 0 ]; then
-        log_warn "Xray-2go 已安装，如需重装请先卸载 (选项 2)"; return
+        log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (选项 2)"; return
     fi
-
-    # 事务保护：所有 ask_* 修改均在快照内，安装失败可完整回滚
-    state_begin_txn
 
     ask_argo_mode
     [ "$(state_get '.argo.enabled')" = "true" ] && ask_argo_protocol
@@ -1819,31 +1981,23 @@ _menu_do_install() {
     ask_reality_mode
     ask_vltcp_mode
 
-    [ "$(state_get '.argo.enabled')" = "true" ] && \
-        port_in_use "$(state_get '.argo.port')" && \
-        log_warn "Argo 端口 $(state_get '.argo.port') 已被占用，可安装后修改"
-    [ "$(state_get '.ff.enabled')" = "true" ] && port_in_use 8080 && \
-        log_warn "端口 8080 已被占用，FreeFlow 可能无法启动"
+    # 端口重叠预警（实际冲突由 _check_port_conflicts 处理）
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
         local _rp _ap
         _rp=$(state_get '.reality.port'); _ap=$(state_get '.argo.port')
         [ "${_rp}" = "${_ap}" ] && \
-            log_warn "Reality 端口与 Argo 回源端口相同，请安装后修改其中一个"
+            log_warn "Reality 端口与 Argo 回源端口相同，安装时将自动修正"
     fi
-    [ "$(state_get '.vltcp.enabled')" = "true" ] && \
-        port_in_use "$(state_get '.vltcp.port')" && \
-        log_warn "VLESS-TCP 端口 $(state_get '.vltcp.port') 已被占用，可安装后修改"
 
     check_bbr
 
     if ! exec_install_core; then
         log_error "安装失败"
-        state_rollback_txn   # 恢复 _STATE 至安装向导启动前
         _pause
         return
     fi
 
-    state_commit_txn   # 持久化
+    state_persist || log_warn "state.json 写入失败"
 
     [ "$(state_get '.argo.enabled')" = "true" ] && \
         { apply_fixed_tunnel || \
