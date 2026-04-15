@@ -1947,8 +1947,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║        Xray-2go  v8.0  隔离运行模型      ║${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║        工作目录: /etc/xray2go             ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        Xray-2go  v8.0   隔离运行模型      ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
