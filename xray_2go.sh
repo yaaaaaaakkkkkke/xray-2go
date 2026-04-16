@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v10.0
+# xray-2go
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-# v10.0 变更（相对 v9.0）：海外VPS纯入站极致性能版
 #   [dns]     改用系统 localhost 解析器 / 修复 systemd-resolved stub / queryStrategy=UseIPv4v6
 #   [config]  删除国内分流 routing / 零 routing 规则（纯转发）/ outbound mark 自适应
 #   [memory]  RAM+SWAP 检测与自动扩展至 2G（swapfile）
@@ -2588,7 +2587,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║               Xray-2go  v8.0             ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║                  Xray-2go                ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
