@@ -1651,7 +1651,15 @@ ask_vltcp_mode() {
 
 # ==============================================================================
 # §27 CLI — 管理子菜单
+#
+# 每个代理模块均提供：启用 / 禁用 / 重启 / 卸载 四项基础操作
+#   - 重启 xray 系列（FF/Reality/VLTCP）：重启 xray2go 服务
+#   - 重启 Argo：重启 tunnel2go 服务
+#   - 卸载某模块：禁用 → apply_config → firewall_sync → （Argo 额外停服务+删文件）
 # ==============================================================================
+
+# ── 公共辅助 ────────────────────────────────────────────────────────────────
+
 _input_port() {
     local _jq_path="$1" _p
     prompt "新端口（回车随机）: " _p
@@ -1668,33 +1676,117 @@ _input_port() {
     printf '%s' "${_p}"
 }
 
+# 重启 xray2go 主进程（FreeFlow / Reality / VLESS-TCP 共用）
+_restart_xray_svc() {
+    [ -f "${CONFIG_FILE}" ] || { log_error "配置文件不存在，请先完成安装"; return 1; }
+    exec_svc restart "${_SVC_XRAY}" \
+        && { log_ok "${_SVC_XRAY} 已重启"; _verify_service_health "${_SVC_XRAY}" 6; } \
+        || { log_error "${_SVC_XRAY} 重启失败"; return 1; }
+}
+
+# 确认卸载某模块
+_confirm_uninstall() {
+    local _name="$1" _a
+    prompt "确定要卸载 ${_name}？此操作将关闭该协议入站 (y/N): " _a
+    case "${_a:-n}" in y|Y) return 0;; *) return 1;; esac
+}
+
+# ── Argo 管理 ────────────────────────────────────────────────────────────────
+
 manage_argo() {
-    [ "$(state_get '.argo.enabled')" = "true" ] || { log_warn "未启用 Argo"; sleep 1; return; }
-    [ -f "${ARGO_BIN}" ]                         || { log_warn "Argo 未安装"; sleep 1; return; }
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
-        local _astat _domain _proto _port
+        local _en _astat _domain _proto _port
+        _en=$(state_get '.argo.enabled')
         _astat=$(check_argo)
-        _domain=$(state_get '.argo.domain'); _proto=$(state_get '.argo.protocol')
+        _domain=$(state_get '.argo.domain')
+        _proto=$(state_get '.argo.protocol')
         _port=$(state_get '.argo.port')
+
         clear; echo ""; log_title "══ Argo 固定隧道管理 ══"
-        printf "  状态: ${C_GRN}%s${C_RST}  协议: ${C_CYN}%s${C_RST}  端口: ${C_YLW}%s${C_RST}\n" \
-            "${_astat}" "${_proto}" "${_port}"
-        if [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ]; then
-            printf "  域名: ${C_GRN}%s${C_RST}\n" "${_domain}"
+        if [ "${_en}" = "true" ]; then
+            printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_astat}"
+            printf "  协议: ${C_CYN}%s${C_RST}  回源端口: ${C_YLW}%s${C_RST}\n" "${_proto}" "${_port}"
+            if [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ]; then
+                printf "  域名: ${C_GRN}%s${C_RST}\n" "${_domain}"
+            else
+                printf "  域名: ${C_YLW}未配置（请选项 4 配置）${C_RST}\n"
+            fi
         else
-            printf "  域名: ${C_YLW}未配置（请选项1配置）${C_RST}\n"
+            printf "  模块: ${C_YLW}未启用${C_RST}\n"
         fi
         _hr
-        printf "  ${C_GRN}1.${C_RST} 添加/更新固定隧道\n"
-        printf "  ${C_GRN}2.${C_RST} 切换协议 (WS ↔ XHTTP)\n"
-        printf "  ${C_GRN}3.${C_RST} 修改回源端口 (当前: ${C_YLW}${_port}${C_RST})\n"
-        printf "  ${C_GRN}4.${C_RST} 启动隧道\n"
-        printf "  ${C_GRN}5.${C_RST} 停止隧道\n"
-        printf "  ${C_GRN}6.${C_RST} 健康检查\n"
+        printf "  ${C_GRN}1.${C_RST} 启用 Argo\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 Argo\n"
+        printf "  ${C_GRN}3.${C_RST} 重启隧道服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 Argo（停服务 + 删文件）\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 配置/更新固定隧道域名\n"
+        printf "  ${C_GRN}5.${C_RST} 切换协议 (WS ↔ XHTTP)\n"
+        printf "  ${C_GRN}6.${C_RST} 修改回源端口 (当前: ${C_YLW}${_port}${C_RST})\n"
+        printf "  ${C_GRN}7.${C_RST} 查看节点链接\n"
+        printf "  ${C_GRN}8.${C_RST} 健康检查\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1)
+            1) # 启用
+                if [ "${_en}" = "true" ]; then
+                    log_info "Argo 已处于启用状态"; _pause; continue
+                fi
+                if [ ! -f "${ARGO_BIN}" ] || [ ! -x "${ARGO_BIN}" ]; then
+                    log_step "下载 cloudflared..."
+                    download_cloudflared || { _pause; continue; }
+                fi
+                state_set '.argo.enabled = true' || { _pause; continue; }
+                apply_config   || { state_set '.argo.enabled = false'; _pause; continue; }
+                apply_tunnel_service; exec_svc_reload
+                exec_svc enable "${_SVC_TUNNEL}"
+                exec_svc start  "${_SVC_TUNNEL}" \
+                    && log_ok "Argo 已启用并启动" \
+                    || log_warn "Argo 启用成功，但服务启动失败，请检查域名配置"
+                state_persist || log_warn "state.json 写入失败" ;;
+            2) # 禁用
+                if [ "${_en}" != "true" ]; then
+                    log_info "Argo 已处于禁用状态"; _pause; continue
+                fi
+                exec_svc stop    "${_SVC_TUNNEL}" 2>/dev/null || true
+                exec_svc disable "${_SVC_TUNNEL}" 2>/dev/null || true
+                state_set '.argo.enabled = false' || { _pause; continue; }
+                apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "Argo 已禁用（配置和文件保留，可随时重新启用）" ;;
+            3) # 重启
+                if [ "${_en}" != "true" ]; then
+                    log_warn "Argo 未启用，请先选项 1 启用"; _pause; continue
+                fi
+                exec_svc restart "${_SVC_TUNNEL}" \
+                    && { log_ok "${_SVC_TUNNEL} 已重启"
+                         _verify_service_health "${_SVC_TUNNEL}" 6; } \
+                    || log_error "${_SVC_TUNNEL} 重启失败" ;;
+            9) # 卸载
+                _confirm_uninstall "Argo" || { _pause; continue; }
+                exec_svc stop    "${_SVC_TUNNEL}" 2>/dev/null || true
+                exec_svc disable "${_SVC_TUNNEL}" 2>/dev/null || true
+                if is_systemd; then
+                    rm -f "/etc/systemd/system/${_SVC_TUNNEL}.service" 2>/dev/null || true
+                    systemctl daemon-reload >/dev/null 2>&1 || true
+                else
+                    rm -f "/etc/init.d/${_SVC_TUNNEL}" 2>/dev/null || true
+                fi
+                rm -f "${ARGO_BIN}"               2>/dev/null || true
+                rm -f "${WORK_DIR}/tunnel.yml"     2>/dev/null || true
+                rm -f "${WORK_DIR}/tunnel.json"    2>/dev/null || true
+                rm -f "${ARGO_LOG}"               2>/dev/null || true
+                state_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed"' \
+                    || true
+                apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                log_ok "Argo 已完全卸载（state 中协议/端口配置保留，重新启用时可复用）"
+                _pause; return ;;
+            4) # 配置固定隧道
+                if [ "${_en}" != "true" ]; then
+                    log_warn "请先选项 1 启用 Argo"; _pause; continue
+                fi
                 echo ""
                 printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"
                 printf "  ${C_GRN}2.${C_RST} XHTTP\n"
@@ -1704,7 +1796,10 @@ manage_argo() {
                     1) state_set '.argo.protocol = "ws"';;
                 esac
                 apply_fixed_tunnel && print_nodes || log_error "固定隧道配置失败" ;;
-            2)
+            5) # 切换协议
+                if [ "${_en}" != "true" ]; then
+                    log_warn "请先选项 1 启用 Argo"; _pause; continue
+                fi
                 local _np; [ "${_proto}" = "ws" ] && _np="xhttp" || _np="ws"
                 state_set '.argo.protocol = $p' --arg p "${_np}" || { _pause; continue; }
                 if apply_config && state_persist; then
@@ -1713,10 +1808,9 @@ manage_argo() {
                     log_error "切换失败，回滚"
                     state_set '.argo.protocol = $p' --arg p "${_proto}"
                 fi ;;
-            3) exec_update_argo_port ;;
-            4) exec_svc start  "${_SVC_TUNNEL}" && log_ok "隧道已启动" || log_error "启动失败" ;;
-            5) exec_svc stop   "${_SVC_TUNNEL}" && log_ok "隧道已停止" || log_error "停止失败" ;;
-            6) check_argo_health || true ;;
+            6) exec_update_argo_port ;;
+            7) print_nodes ;;
+            8) check_argo_health || true ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1724,47 +1818,89 @@ manage_argo() {
     done
 }
 
+# ── FreeFlow 管理 ─────────────────────────────────────────────────────────────
+
 manage_freeflow() {
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
         local _en _proto _path
-        _en=$(state_get '.ff.enabled'); _proto=$(state_get '.ff.protocol')
+        _en=$(state_get '.ff.enabled')
+        _proto=$(state_get '.ff.protocol')
         _path=$(state_get '.ff.path')
+
+        # xray2go 服务真实运行状态
+        local _xstat
+        exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
+
         clear; echo ""; log_title "══ FreeFlow 管理 ══"
-        [ "${_en}" = "true" ] && [ "${_proto}" != "none" ] \
-            && printf "  状态: ${C_GRN}已启用${C_RST}  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}\n" \
-                "${_proto}" "${_path}" \
-            || printf "  状态: ${C_YLW}未启用${C_RST}\n"
+        if [ "${_en}" = "true" ] && [ "${_proto}" != "none" ]; then
+            printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}"
+            printf "  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}  端口: 8080\n" "${_proto}" "${_path}"
+        else
+            printf "  模块: ${C_YLW}未启用${C_RST}\n"
+        fi
         _hr
-        printf "  ${C_GRN}1.${C_RST} 添加/变更方式\n"
-        printf "  ${C_GRN}2.${C_RST} 修改 path\n"
-        printf "  ${C_RED}3.${C_RST} 卸载 FreeFlow\n"
+        printf "  ${C_GRN}1.${C_RST} 启用 FreeFlow\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 FreeFlow\n"
+        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 FreeFlow\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 变更传输协议\n"
+        printf "  ${C_GRN}5.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
+        printf "  ${C_GRN}6.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1)
+            1) # 启用
+                if [ "${_en}" = "true" ] && [ "${_proto}" != "none" ]; then
+                    log_info "FreeFlow 已处于启用状态"; _pause; continue
+                fi
                 ask_freeflow_mode
-                apply_config  || { log_error "配置更新失败"; _pause; continue; }
+                [ "$(state_get '.ff.enabled')" = "true" ] || { _pause; continue; }
+                apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
-                log_ok "FreeFlow 已变更"; print_nodes ;;
-            2)
+                log_ok "FreeFlow 已启用"; print_nodes ;;
+            2) # 禁用
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
-                    log_warn "FreeFlow 未启用，请先选择 [1]"; _pause; continue
+                    log_info "FreeFlow 已处于禁用状态"; _pause; continue
+                fi
+                state_set '.ff.enabled = false | .ff.protocol = "none"' || { _pause; continue; }
+                apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                firewall_sync
+                log_ok "FreeFlow 已禁用（path 配置保留）" ;;
+            3) # 重启
+                _restart_xray_svc || true ;;
+            9) # 卸载
+                _confirm_uninstall "FreeFlow" || { _pause; continue; }
+                state_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/"' \
+                    || { _pause; continue; }
+                apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                firewall_sync
+                log_ok "FreeFlow 已卸载（配置已重置）"
+                _pause; return ;;
+            4) # 变更协议
+                ask_freeflow_mode
+                [ "$(state_get '.ff.enabled')" = "true" ] || { _pause; continue; }
+                apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                firewall_sync
+                log_ok "FreeFlow 协议已变更"; print_nodes ;;
+            5) # 修改 path
+                if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
+                    log_warn "请先选项 1 启用 FreeFlow"; _pause; continue
                 fi
                 local _p; prompt "新 path（回车保持 ${_path}）: " _p
                 if [ -n "${_p:-}" ]; then
                     case "${_p}" in /*) :;; *) _p="/${_p}";; esac
                     state_set '.ff.path = $p' --arg p "${_p}" || { _pause; continue; }
-                    apply_config  || { log_error "更新失败"; _pause; continue; }
+                    apply_config  || { _pause; continue; }
                     state_persist || log_warn "state.json 写入失败"
-                    log_ok "path 已修改: ${_p}"; print_nodes
+                    log_ok "path 已更新: ${_p}"; print_nodes
                 fi ;;
-            3)
-                state_set '.ff.enabled = false | .ff.protocol = "none"' || { _pause; continue; }
-                apply_config  || { log_error "卸载失败"; _pause; continue; }
-                state_persist || log_warn "state.json 写入失败"
-                firewall_sync
-                log_ok "FreeFlow 已卸载" ;;
+            6) print_nodes ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1772,85 +1908,120 @@ manage_freeflow() {
     done
 }
 
+# ── Reality 管理 ──────────────────────────────────────────────────────────────
+
 manage_reality() {
-    [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
         local _en _port _sni _pbk _pvk _sid _net _pbk_disp
-        _en=$(  state_get '.reality.enabled');  _port=$(state_get '.reality.port')
-        _sni=$( state_get '.reality.sni');      _pbk=$(state_get  '.reality.pbk')
-        _pvk=$( state_get '.reality.pvk');      _sid=$(state_get  '.reality.sid')
-        _net=$( state_get '.reality.network');  _net="${_net:-tcp}"
+        _en=$(  state_get '.reality.enabled')
+        _port=$(state_get '.reality.port')
+        _sni=$( state_get '.reality.sni')
+        _pbk=$( state_get '.reality.pbk')
+        _pvk=$( state_get '.reality.pvk')
+        _sid=$( state_get '.reality.sid')
+        _net=$( state_get '.reality.network'); _net="${_net:-tcp}"
         _pbk_disp="未生成"
         [ -n "${_pbk:-}" ] && [ "${_pbk}" != "null" ] && _pbk_disp="${_pbk:0:16}..."
+
+        local _xstat
+        exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
+
         clear; echo ""; log_title "══ Reality 管理 ══"
-        [ "${_en}" = "true" ] \
-            && printf "  状态: ${C_GRN}已启用${C_RST}\n" \
-            || printf "  状态: ${C_YLW}未启用${C_RST}\n"
+        if [ "${_en}" = "true" ]; then
+            printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}"
+        else
+            printf "  模块: ${C_YLW}未启用${C_RST}\n"
+        fi
         printf "  端口: ${C_YLW}%s${C_RST}  SNI: ${C_CYN}%s${C_RST}  传输: ${C_GRN}%s${C_RST}\n" \
             "${_port}" "${_sni}" "${_net}"
         printf "  公钥: %s\n" "${_pbk_disp}"
         [ -n "${_sid:-}" ] && [ "${_sid}" != "null" ] \
             && printf "  ShortId: ${C_CYN}%s${C_RST}\n" "${_sid}"
         _hr
-        printf "  ${C_GRN}1.${C_RST} 启用\n"
-        printf "  ${C_RED}2.${C_RST} 禁用\n"
-        printf "  ${C_GRN}3.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
-        printf "  ${C_GRN}4.${C_RST} 修改 SNI（当前: ${C_CYN}${_sni}${C_RST}）\n"
-        printf "  ${C_GRN}5.${C_RST} 切换传输方式（当前: ${C_GRN}${_net}${C_RST}）\n"
-        printf "  ${C_GRN}6.${C_RST} 重新生成密钥对\n"
-        printf "  ${C_GRN}7.${C_RST} 查看节点\n"
+        printf "  ${C_GRN}1.${C_RST} 启用 Reality\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 Reality\n"
+        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 Reality（禁用 + 清除密钥）\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
+        printf "  ${C_GRN}5.${C_RST} 修改 SNI（当前: ${C_CYN}${_sni}${C_RST}）\n"
+        printf "  ${C_GRN}6.${C_RST} 切换传输方式（当前: ${C_GRN}${_net}${C_RST}）\n"
+        printf "  ${C_GRN}7.${C_RST} 重新生成密钥对\n"
+        printf "  ${C_GRN}8.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1)
+            1) # 启用
+                if [ "${_en}" = "true" ]; then
+                    log_info "Reality 已处于启用状态"; _pause; continue
+                fi
+                [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
                 if [ -z "${_pvk:-}" ] || [ "${_pvk}" = "null" ]; then
-                    [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
+                    log_step "首次启用，生成 x25519 密钥对..."
                     _gen_reality_keypair || { _pause; continue; }
                     state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || true
                 fi
                 state_set '.reality.enabled = true' || { _pause; continue; }
-                apply_config  || { _pause; continue; }
+                apply_config  || { state_set '.reality.enabled = false'; _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "Reality 已启用"; print_nodes ;;
-            2)
+            2) # 禁用
+                if [ "${_en}" != "true" ]; then
+                    log_info "Reality 已处于禁用状态"; _pause; continue
+                fi
                 state_set '.reality.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
-                log_ok "Reality 已禁用" ;;
-            3)
-                local _np; _np=$(_input_port '.reality.port') || { _pause; continue; }
+                log_ok "Reality 已禁用（端口/SNI/密钥配置保留）" ;;
+            3) # 重启
+                _restart_xray_svc || true ;;
+            9) # 卸载
+                _confirm_uninstall "Reality" || { _pause; continue; }
+                state_set '.reality.enabled = false | .reality.pbk = null | .reality.pvk = null | .reality.sid = null' \
+                    || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
-                log_ok "端口已更新: ${_np}"; print_nodes ;;
-            4)
+                log_ok "Reality 已卸载（端口/SNI 配置保留，密钥已清除）"
+                _pause; return ;;
+            4) # 修改端口
+                local _np; _np=$(_input_port '.reality.port') || { _pause; continue; }
+                [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
+                state_persist || log_warn "state.json 写入失败"
+                firewall_sync
+                log_ok "端口已更新: ${_np}"
+                [ "${_en}" = "true" ] && print_nodes ;;
+            5) # 修改 SNI
                 log_info "建议：addons.mozilla.org / www.microsoft.com / www.apple.com"
                 local _s; prompt "新 SNI（回车保持 ${_sni}）: " _s
                 if [ -n "${_s:-}" ]; then
                     printf '%s' "${_s}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
                         || { log_error "SNI 格式不合法"; _pause; continue; }
                     state_set '.reality.sni = $s' --arg s "${_s}" || { _pause; continue; }
-                    apply_config  || { _pause; continue; }
+                    [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                     state_persist || log_warn "state.json 写入失败"
-                    log_ok "SNI 已更新: ${_s}"; print_nodes
+                    log_ok "SNI 已更新: ${_s}"
+                    [ "${_en}" = "true" ] && print_nodes
                 fi ;;
-            5)
+            6) # 切换传输
                 local _nn; [ "${_net}" = "tcp" ] && _nn="xhttp" || _nn="tcp"
                 state_set '.reality.network = $n' --arg n "${_nn}" || { _pause; continue; }
-                apply_config  || { _pause; continue; }
+                [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
-                log_ok "传输方式已切换: ${_nn}"; print_nodes ;;
-            6)
+                log_ok "传输方式已切换: ${_nn}"
+                [ "${_en}" = "true" ] && print_nodes ;;
+            7) # 重新生成密钥对
                 [ -x "${XRAY_BIN}" ] || { log_error "xray 未就绪"; _pause; continue; }
                 _gen_reality_keypair || { _pause; continue; }
                 state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)" || { _pause; continue; }
-                [ "$(state_get '.reality.enabled')" = "true" ] && apply_config || true
+                [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 log_ok "密钥对已更新"
-                [ "$(state_get '.reality.enabled')" = "true" ] && print_nodes ;;
-            7) print_nodes ;;
+                [ "${_en}" = "true" ] && print_nodes ;;
+            8) print_nodes ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1858,56 +2029,84 @@ manage_reality() {
     done
 }
 
+# ── VLESS-TCP 管理 ────────────────────────────────────────────────────────────
+
 manage_vltcp() {
-    [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; sleep 1; return; }
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
         local _en _port _listen
         _en=$(    state_get '.vltcp.enabled')
         _port=$(  state_get '.vltcp.port')
         _listen=$(state_get '.vltcp.listen')
+
+        local _xstat
+        exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
+
         clear; echo ""; log_title "══ VLESS-TCP 明文落地管理 ══"
-        [ "${_en}" = "true" ] \
-            && printf "  状态: ${C_GRN}已启用${C_RST}\n" \
-            || printf "  状态: ${C_YLW}未启用${C_RST}\n"
+        if [ "${_en}" = "true" ]; then
+            printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}"
+        else
+            printf "  模块: ${C_YLW}未启用${C_RST}\n"
+        fi
         printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}\n" "${_port}" "${_listen}"
         _hr
-        printf "  ${C_GRN}1.${C_RST} 启用\n"
-        printf "  ${C_RED}2.${C_RST} 禁用\n"
-        printf "  ${C_GRN}3.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
-        printf "  ${C_GRN}4.${C_RST} 修改监听地址（当前: ${C_CYN}${_listen}${C_RST}）\n"
-        printf "  ${C_GRN}5.${C_RST} 查看节点链接\n"
+        printf "  ${C_GRN}1.${C_RST} 启用 VLESS-TCP\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 VLESS-TCP\n"
+        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 VLESS-TCP\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 修改端口（当前: ${C_YLW}${_port}${C_RST}）\n"
+        printf "  ${C_GRN}5.${C_RST} 修改监听地址（当前: ${C_CYN}${_listen}${C_RST}）\n"
+        printf "  ${C_GRN}6.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
-            1)
+            1) # 启用
+                if [ "${_en}" = "true" ]; then
+                    log_info "VLESS-TCP 已处于启用状态"; _pause; continue
+                fi
                 state_set '.vltcp.enabled = true' || { _pause; continue; }
-                apply_config  || { _pause; continue; }
+                apply_config  || { state_set '.vltcp.enabled = false'; _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; print_nodes ;;
-            2)
+            2) # 禁用
+                if [ "${_en}" != "true" ]; then
+                    log_info "VLESS-TCP 已处于禁用状态"; _pause; continue
+                fi
                 state_set '.vltcp.enabled = false' || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
-                log_ok "VLESS-TCP 已禁用" ;;
-            3)
-                local _np; _np=$(_input_port '.vltcp.port') || { _pause; continue; }
+                log_ok "VLESS-TCP 已禁用（端口/监听配置保留）" ;;
+            3) # 重启
+                _restart_xray_svc || true ;;
+            9) # 卸载
+                _confirm_uninstall "VLESS-TCP" || { _pause; continue; }
+                state_set '.vltcp.enabled = false | .vltcp.port = 1234 | .vltcp.listen = "0.0.0.0"' \
+                    || { _pause; continue; }
                 apply_config  || { _pause; continue; }
+                state_persist || log_warn "state.json 写入失败"
+                firewall_sync
+                log_ok "VLESS-TCP 已卸载（端口已重置为默认值）"
+                _pause; return ;;
+            4) # 修改端口
+                local _np; _np=$(_input_port '.vltcp.port') || { _pause; continue; }
+                [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
                 log_ok "端口已更新: ${_np}"
                 [ "${_en}" = "true" ] && print_nodes ;;
-            4)
+            5) # 修改监听地址
                 local _l; prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
                 if [ -n "${_l:-}" ]; then
                     state_set '.vltcp.listen = $l' --arg l "${_l}" || { _pause; continue; }
-                    apply_config  || { _pause; continue; }
+                    [ "${_en}" = "true" ] && { apply_config || { _pause; continue; }; }
                     state_persist || log_warn "state.json 写入失败"
                     log_ok "监听地址已更新: ${_l}"
                     [ "${_en}" = "true" ] && print_nodes
                 fi ;;
-            5) print_nodes ;;
+            6) print_nodes ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1970,7 +2169,8 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║               Xray-2go  v8.0             ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        Xray-2go  v8.0  隔离运行模型      ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║        工作目录: /etc/xray2go             ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
