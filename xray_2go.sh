@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go
+# xray-2go v8.0
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # 架构分层：core → state → protocol → config → runtime → cli
 #
-#   [dns]     改用系统 localhost 解析器 / 修复 systemd-resolved stub / queryStrategy=UseIPv4v6
-#   [config]  删除国内分流 routing / 零 routing 规则（纯转发）/ outbound mark 自适应
-#   [memory]  RAM+SWAP 检测与自动扩展至 2G（swapfile）
-#   [gc]      GOGC 自适应：RAM<512M→100 / 512M-1G→200 / >1G→400，彻底去掉 GOGC=off
-#   [bbr]     BBR 静默全自动（无询问）/ fq_pie 回退 / 内核版本兜底 / openrc 支持
-#   [resolv]  systemd-resolved 检测 → 自动 ln -sf stub-less resolv.conf
+# v8.0 变更（相对 v7.2）：隔离运行模型重构
+#   [架构] 所有资源重命名至 xray2go 命名空间，与系统 xray 完全隔离
+#   [架构] 删除接管逻辑、遗留清理逻辑、state 事务快照
+#   [新增] _xray_health_check: 三重验证（存在+可执行+version+-test）
+#   [新增] _detect_existing_xray: 仅提示，不干预
+#   [新增] _check_port_conflicts: 冲突时自动随机分配新端口
+#   [新增] _verify_service_health: 启动后轮询验证+自动打印失败日志
+#   [新增] _force_cleanup_firewall: 仅清理本脚本托管端口
+#   [新增] _cleanup_processes: 仅清理本脚本 pid 文件
+#   [修改] exec_uninstall: 只删除本脚本资源，不触碰系统 xray
+#   [修改] download_xray: 使用 _xray_health_check 替代简单 version 判断
+#   [修改] exec_install_core: 移除接管逻辑，冲突仅提示后隔离启动
 # ==============================================================================
 set -uo pipefail
 
@@ -26,8 +32,6 @@ readonly XRAY_BIN="${WORK_DIR}/xray"
 readonly ARGO_BIN="${WORK_DIR}/argo"
 readonly CONFIG_FILE="${WORK_DIR}/config.json"
 readonly STATE_FILE="${WORK_DIR}/state.json"
-readonly LOG_DIR="${WORK_DIR}/log"
-readonly XRAY_ERROR_LOG="${LOG_DIR}/error.log"
 readonly ARGO_LOG="${WORK_DIR}/argo.log"
 readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
@@ -36,9 +40,6 @@ readonly _STATE_SCHEMA_VERSION=2
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
 readonly _SVC_XRAY="xray2go"
 readonly _SVC_TUNNEL="tunnel2go"
-readonly _LOGROTATE_CONF="/etc/logrotate.d/xray2go"
-readonly _SYSCTL_CONF="/etc/sysctl.d/89-xray2go.conf"
-readonly _LIMITS_CONF="/etc/security/limits.d/xray2go.conf"
 
 # 可按需增减镜像（顺序即优先级）
 readonly _XRAY_MIRRORS=(
@@ -485,290 +486,6 @@ _verify_service_health() {
 }
 
 # ==============================================================================
-# §5c CORE — 系统性能调优模块（v10.0 海外VPS极致性能版）
-#
-#   _get_cpu_count        : 读取逻辑 CPU 数（供 GOMAXPROCS）
-#   _get_total_ram_mb     : 读取系统 RAM（MB）
-#   _get_gogc_value       : 自适应 GOGC：RAM<512→100 / 512-1024→200 / >1024→400
-#   _ensure_swap_2g       : 检测 RAM+SWAP < 2G 时自动创建 /swapfile 补足
-#   _fix_systemd_resolved : 检测 stub resolver → 修正 resolv.conf 软链接
-#   _apply_kernel_params  : BBR全自动 + 完整网络参数（幂等）
-#   _apply_fd_limits      : fd 上限 1048576
-#   _setup_logrotate      : 日志轮转
-#   apply_system_tuning   : 安装入口
-#   remove_system_tuning  : 卸载清理
-# ==============================================================================
-
-_get_cpu_count() {
-    local _n=1
-    if [ -f /proc/cpuinfo ]; then
-        _n=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')
-    elif command -v nproc >/dev/null 2>&1; then
-        _n=$(nproc 2>/dev/null || printf '1')
-    fi
-    [ "${_n}" -ge 1 ] 2>/dev/null || _n=1
-    printf '%s' "${_n}"
-}
-
-# 返回系统物理 RAM（MB），不含 SWAP
-_get_total_ram_mb() {
-    local _kb=0
-    if [ -f /proc/meminfo ]; then
-        _kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || printf '0')
-    fi
-    printf '%s' "$(( _kb / 1024 ))"
-}
-
-# GOGC 自适应：根据 RAM 大小返回合适的 GC 阈值
-#   RAM < 512 MB  → GOGC=100  （保守，频繁 GC 防止 OOM）
-#   512~1024 MB   → GOGC=200  （均衡，减少 GC 次数）
-#   > 1024 MB     → GOGC=400  （激进，最大化吞吐，GC 代价可接受）
-# 注意：GOGC=off 在低内存 VPS 上可能导致 OOM，已弃用
-_get_gogc_value() {
-    local _ram; _ram=$(_get_total_ram_mb)
-    if   [ "${_ram}" -lt 512  ]; then printf '100'
-    elif [ "${_ram}" -lt 1024 ]; then printf '200'
-    else                               printf '400'
-    fi
-}
-
-# 检测并修复 systemd-resolved stub resolver 问题
-# 问题：systemd-resolved 默认把 127.0.0.53 写入 /etc/resolv.conf（stub 模式）
-#       Xray 的 dns.servers=["localhost"] 最终解析到 127.0.0.53:53
-#       而 stub 会添加额外跳转延迟，且某些环境 stub 不支持 TCP fallback
-# 修复：将 /etc/resolv.conf 软链接到 resolv.conf（无 stub，直接访问上游 DNS）
-_fix_systemd_resolved() {
-    # 只在 systemd-resolved 实际运行时处理
-    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        return 0
-    fi
-    local _stub_free="/run/systemd/resolve/resolv.conf"
-    [ -f "${_stub_free}" ] || { log_info "systemd-resolved: stub-free resolv.conf 不存在，跳过"; return 0; }
-    # 检查当前是否已指向 stub（127.0.0.53）
-    if grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then
-        log_step "修复 systemd-resolved stub resolver..."
-        # 备份原始文件（仅在首次）
-        [ -f /etc/resolv.conf.xray2go-bak ] || \
-            cp -f /etc/resolv.conf /etc/resolv.conf.xray2go-bak 2>/dev/null || true
-        ln -sf "${_stub_free}" /etc/resolv.conf \
-            && log_ok "resolv.conf 已指向 stub-free 路径（直连上游 DNS）" \
-            || log_warn "resolv.conf 软链接失败，DNS 性能可能受影响"
-    else
-        log_info "resolv.conf 无 stub，DNS 配置正常"
-    fi
-}
-
-# 确保 RAM + SWAP 总量 >= 2G，不足时自动创建 /swapfile 补足
-_ensure_swap_2g() {
-    local _target_mb=2048
-    local _ram_mb; _ram_mb=$(_get_total_ram_mb)
-
-    # 读取已有 SWAP（MB）
-    local _swap_mb=0
-    if [ -f /proc/meminfo ]; then
-        _swap_mb=$(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || printf '0')
-    fi
-
-    local _total_mb=$(( _ram_mb + _swap_mb ))
-    log_info "内存检测: RAM=${_ram_mb}MB SWAP=${_swap_mb}MB 合计=${_total_mb}MB"
-
-    [ "${_total_mb}" -ge "${_target_mb}" ] && {
-        log_ok "RAM+SWAP 已满足 ${_target_mb}MB 要求"; return 0
-    }
-
-    local _need_mb=$(( _target_mb - _total_mb ))
-    log_warn "RAM+SWAP 不足 ${_target_mb}MB，将创建 ${_need_mb}MB swapfile..."
-
-    # 检查 /swapfile 是否已存在且足够
-    if [ -f /swapfile ]; then
-        local _existing_mb
-        _existing_mb=$(( $(stat -c%s /swapfile 2>/dev/null || printf '0') / 1048576 ))
-        if [ "${_existing_mb}" -ge "${_need_mb}" ]; then
-            log_info "现有 /swapfile (${_existing_mb}MB) 已足够，尝试激活..."
-            swapon /swapfile 2>/dev/null || true
-            return 0
-        fi
-        swapoff /swapfile 2>/dev/null || true
-        rm -f /swapfile 2>/dev/null || true
-    fi
-
-    # 检查根分区剩余空间（需大于 need_mb + 256MB 余量）
-    local _free_mb
-    _free_mb=$(df -m / 2>/dev/null | awk 'NR==2{print $4}' || printf '0')
-    if [ "${_free_mb}" -lt "$(( _need_mb + 256 ))" ]; then
-        log_warn "磁盘剩余空间不足（${_free_mb}MB），跳过 swapfile 创建"
-        return 0
-    fi
-
-    # 创建 swapfile（优先 fallocate，回退 dd）
-    log_step "创建 ${_need_mb}MB swapfile..."
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l "${_need_mb}M" /swapfile 2>/dev/null
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count="${_need_mb}" status=none 2>/dev/null
-    fi
-
-    if [ ! -s /swapfile ]; then
-        log_warn "swapfile 创建失败，跳过"; return 0
-    fi
-
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null 2>&1 || { log_warn "mkswap 失败"; rm -f /swapfile; return 0; }
-    swapon /swapfile 2>/dev/null    || { log_warn "swapon 失败"; return 0; }
-
-    # 持久化（写入 fstab，避免重复添加）
-    grep -q '/swapfile' /etc/fstab 2>/dev/null || \
-        printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
-
-    # 调低 swappiness（代理场景优先用 RAM）
-    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-
-    log_ok "swapfile 已创建并激活 (${_need_mb}MB，swappiness=10)"
-}
-
-# BBR 全自动启用（无交互）
-# 策略：内核 >= 4.9 → 尝试 BBR；不支持则回退 cubic；不询问用户
-# BBR 配套：fq（Fair Queue）调度器 + 完整参数写入 sysctl
-_apply_bbr() {
-    # 内核版本检查
-    if ! _kernel_ge 4 9; then
-        log_warn "内核 < 4.9，不支持 BBR，保留当前拥塞控制"
-        return 0
-    fi
-
-    local _cur; _cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')
-    if [ "${_cur}" = "bbr" ]; then
-        log_ok "TCP BBR 已启用"; return 0
-    fi
-
-    log_step "自动启用 TCP BBR..."
-
-    # 加载 tcp_bbr 模块（容器环境可能失败，静默处理）
-    modprobe tcp_bbr 2>/dev/null || true
-
-    # 验证 BBR 可用性
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q 'bbr'; then
-        log_warn "tcp_bbr 模块不可用（容器/旧内核），保留 ${_cur}"
-        return 0
-    fi
-
-    # 写入 BBR 专属 sysctl（与主调优文件分开，便于单独删除）
-    mkdir -p /etc/sysctl.d /etc/modules-load.d 2>/dev/null || true
-    cat > /etc/sysctl.d/88-xray2go-bbr.conf << 'BBR_EOF'
-# xray2go BBR — auto generated
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-BBR_EOF
-    printf 'tcp_bbr\n' > /etc/modules-load.d/xray2go-bbr.conf
-
-    sysctl -p /etc/sysctl.d/88-xray2go-bbr.conf >/dev/null 2>&1 \
-        && log_ok "TCP BBR + fq 已启用" \
-        || log_warn "BBR sysctl 应用失败（容器环境正常）"
-}
-
-_apply_kernel_params() {
-    log_step "应用内核网络参数..."
-    mkdir -p /etc/sysctl.d 2>/dev/null || true
-    cat > "${_SYSCTL_CONF}" << 'SYSCTL_EOF'
-# xray2go network tuning v10.0 — auto generated, safe to delete
-# ── 连接队列 ──
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-# ── TCP Fast Open（3 = 客户端+服务端双向）──
-net.ipv4.tcp_fastopen = 3
-# ── TIME_WAIT 优化 ──
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = 65535
-# ── 接收/发送缓冲区（128MB）──
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 134217728
-net.ipv4.tcp_wmem = 4096 1048576 134217728
-# ── 端口范围 ──
-net.ipv4.ip_local_port_range = 10000 65535
-# ── 文件句柄总量 ──
-fs.file-max = 1048576
-# ── SWAP 倾向（低值 = 优先用 RAM）──
-vm.swappiness = 10
-# ── 内核 keepalive（防 NAT 断连）──
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 6
-# ── 出站/入站连接超时缩短 ──
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_retries2 = 8
-SYSCTL_EOF
-    sysctl -p "${_SYSCTL_CONF}" >/dev/null 2>&1 \
-        && log_ok "内核网络参数已应用" \
-        || log_warn "部分内核参数应用失败（容器环境下属正常）"
-}
-
-_apply_fd_limits() {
-    log_step "配置文件描述符上限..."
-    mkdir -p /etc/security/limits.d 2>/dev/null || true
-    cat > "${_LIMITS_CONF}" << 'LIMITS_EOF'
-# xray2go fd limits — auto generated
-*    soft nofile 1048576
-*    hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-LIMITS_EOF
-    ulimit -n 1048576 2>/dev/null || ulimit -n 65535 2>/dev/null || true
-    log_ok "文件描述符上限已配置 (1048576)"
-}
-
-_setup_logrotate() {
-    command -v logrotate >/dev/null 2>&1 || return 0
-    mkdir -p "${LOG_DIR}" /etc/logrotate.d 2>/dev/null || true
-    cat > "${_LOGROTATE_CONF}" << LOGROTATE_EOF
-# xray2go log rotation — auto generated
-${XRAY_ERROR_LOG}
-${ARGO_LOG}
-{
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    su root root
-}
-LOGROTATE_EOF
-    log_ok "日志轮转已配置 (每日轮转，保留 7 天)"
-}
-
-apply_system_tuning() {
-    log_title "系统性能调优 (v10.0)"
-    _ensure_swap_2g
-    _fix_systemd_resolved
-    _apply_bbr
-    _apply_kernel_params
-    _apply_fd_limits
-    _setup_logrotate
-    log_ok "系统调优完成"
-}
-
-remove_system_tuning() {
-    rm -f "${_SYSCTL_CONF}"                      2>/dev/null || true
-    rm -f "${_LIMITS_CONF}"                      2>/dev/null || true
-    rm -f "${_LOGROTATE_CONF}"                   2>/dev/null || true
-    rm -f /etc/sysctl.d/88-xray2go-bbr.conf      2>/dev/null || true
-    rm -f /etc/modules-load.d/xray2go-bbr.conf   2>/dev/null || true
-    # 还原 resolv.conf（如果当初备份过）
-    if [ -f /etc/resolv.conf.xray2go-bak ]; then
-        cp -f /etc/resolv.conf.xray2go-bak /etc/resolv.conf 2>/dev/null || true
-        rm -f /etc/resolv.conf.xray2go-bak 2>/dev/null || true
-        log_info "resolv.conf 已还原"
-    fi
-    log_info "系统调优配置已清除"
-}
-
-# ==============================================================================
 # §5c CORE — Argo 隧道健康检查
 # ==============================================================================
 check_argo_health() {
@@ -795,9 +512,23 @@ check_argo_health() {
 # ==============================================================================
 # §6  CORE — 环境自愈
 # ==============================================================================
-# check_bbr: v10.0 已由 apply_system_tuning → _apply_bbr 全自动处理
-# 保留空壳供 _menu_do_install 调用，避免 unbound variable 错误
-check_bbr() { :; }
+check_bbr() {
+    local _a; _a=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')
+    [ "${_a}" = "bbr" ] && { log_ok "TCP BBR 已启用"; return 0; }
+    log_warn "当前拥塞控制: ${_a}（推荐 BBR）"
+    _kernel_ge 4 9 || { log_warn "内核 < 4.9，不支持 BBR"; return 0; }
+    is_systemd || return 0
+    local _ans; prompt "是否启用 BBR？(y/N): " _ans
+    case "${_ans:-n}" in y|Y)
+        modprobe tcp_bbr 2>/dev/null || true
+        mkdir -p /etc/modules-load.d /etc/sysctl.d
+        printf 'tcp_bbr\n' > /etc/modules-load.d/xray2go-bbr.conf
+        printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' \
+            > /etc/sysctl.d/88-xray2go-bbr.conf
+        sysctl -p /etc/sysctl.d/88-xray2go-bbr.conf >/dev/null 2>&1
+        log_ok "BBR 已启用"
+    ;; esac
+}
 
 fix_time_sync() {
     [ -f /etc/redhat-release ] || [ -f /etc/centos-release ] || return 0
@@ -1174,17 +905,7 @@ link_vltcp() {
 }
 
 # ==============================================================================
-# §14 CONFIG — 配置合成（v10.0 海外VPS纯入站极致性能版）
-#
-# 设计原则：零分流、最小路径、最低延迟
-#   log      : access=none（消除高并发下日志 IO 写放大）
-#   dns      : 仅使用系统 localhost 解析器（单跳，无二次查询）
-#              queryStrategy=UseIPv4v6（海外 VPS 双栈优先，减少 DNS 重试）
-#              已通过 _fix_systemd_resolved 确保 localhost 不是 stub resolver
-#   routing  : 无任何规则 — 零匹配开销，所有流量直通 freedom outbound
-#   policy   : bufferSize 自适应（RAM<512M→256K / 512M-1G→512K / >1G→1024K）
-#              握手超时 4s / 空闲 300s / 半关闭 1s
-#   outbound : tcpFastOpen + keepalive + noDelay；去掉 mark（无策略路由需求）
+# §14 CONFIG — 配置合成（端口+listen 冲突检测）
 # ==============================================================================
 config_synthesize() {
     local _ibs="[]" _ib _name _fn _used_keys=""
@@ -1213,63 +934,10 @@ config_synthesize() {
     [ "$(printf '%s' "${_ibs}" | jq 'length')" -eq 0 ] && \
         log_warn "所有入站均已禁用，xray 将以零入站模式运行"
 
-    # bufferSize 自适应（KB）
-    local _ram; _ram=$(_get_total_ram_mb)
-    local _buf=512
-    [ "${_ram}" -lt 512  ] && _buf=256
-    [ "${_ram}" -ge 1024 ] && _buf=1024
-
-    jq -n \
-        --argjson inbounds  "${_ibs}" \
-        --arg     errlog    "${XRAY_ERROR_LOG}" \
-        --argjson bufsize   "${_buf}" \
-    '{
-        "log": {
-            "loglevel": "warning",
-            "access":   "none",
-            "error":    $errlog
-        },
-        "dns": {
-            "servers": ["localhost"],
-            "queryStrategy": "UseIPv4v6"
-        },
-        "policy": {
-            "levels": {
-                "0": {
-                    "handshake":    4,
-                    "connIdle":     300,
-                    "uplinkOnly":   1,
-                    "downlinkOnly": 1,
-                    "bufferSize":   $bufsize,
-                    "statsUserUplink":   false,
-                    "statsUserDownlink": false
-                }
-            },
-            "system": {
-                "statsInboundUplink":    false,
-                "statsInboundDownlink":  false,
-                "statsOutboundUplink":   false,
-                "statsOutboundDownlink": false
-            }
-        },
-        "inbounds": $inbounds,
-        "outbounds": [
-            {
-                "protocol": "freedom",
-                "tag": "direct",
-                "settings": {
-                    "domainStrategy": "UseIPv4v6"
-                },
-                "streamSettings": {
-                    "sockopt": {
-                        "tcpFastOpen":           true,
-                        "tcpKeepAliveInterval":  30,
-                        "tcpKeepAliveIdle":      60,
-                        "tcpNoDelay":            true
-                    }
-                }
-            }
-        ]
+    jq -n --argjson inbounds "${_ibs}" '{
+        log:      {loglevel:"warning"},
+        inbounds: $inbounds,
+        outbounds:[{protocol:"freedom"}]
     }' || { log_error "config JSON 合成失败"; return 1; }
 }
 
@@ -1336,68 +1004,9 @@ _svc_write() {
 }
 
 # Service 模板 — 均使用 xray2go 命名
-# _tpl_xray_systemd 优化说明：
-#   GOMAXPROCS    : 绑定 Go 运行时线程数 = 物理 CPU 数，避免过多线程调度开销
-#   GOGC=off      : 禁用 Go GC 触发阈值（Xray 本身内存可控，关闭比例阈值减少 GC 停顿）
-#   XRAY_LOCATION_ASSET : 指定 geoip/geosite 数据文件目录
-#   LimitNOFILE   : 文件描述符上限 1M，支撑高并发
-#   LimitNPROC    : 线程数上限
-#   LimitMEMLOCK  : 允许内存锁定（mlock），防止关键页面被 swap 出去
-#   TasksMax      : 无限制任务数
-#   OOMScoreAdjust: -500 降低被 OOM killer 选中概率
-#   PrivateTmp    : 隔离 /tmp，安全加固
-#   ProtectSystem : 保护系统目录只读
-#   AmbientCapabilities: NET_ADMIN + NET_BIND_SERVICE（绑定特权端口 + 路由标记）
-#   WatchdogSec   : systemd 看门狗（需进程响应 sd_notify，Xray 不支持故设为 0 禁用）
-#   Restart=always + RestartSec=3 : 异常退出自动重启
 _tpl_xray_systemd() {
-    local _ncpu; _ncpu=$(_get_cpu_count)
-    local _gogc; _gogc=$(_get_gogc_value)
-    cat << UNIT_EOF
-[Unit]
-Description=Xray2go Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network-online.target nss-lookup.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-NoNewPrivileges=yes
-ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
-Restart=always
-RestartSec=3
-RestartPreventExitStatus=23
-
-# Go 运行时调优
-# GOMAXPROCS = 逻辑CPU数，绑定运行时线程，避免超额调度
-# GOGC = 自适应GC阈值（RAM<512M→100 / 512-1024M→200 / >1G→400）
-#        比 GOGC=off 更安全，低内存VPS不会因无GC导致OOM
-Environment=GOMAXPROCS=${_ncpu}
-Environment=GOGC=${_gogc}
-Environment=XRAY_LOCATION_ASSET=${WORK_DIR}
-
-# 文件描述符与进程资源
-LimitNOFILE=1048576
-LimitNPROC=65535
-LimitMEMLOCK=infinity
-TasksMax=infinity
-
-# OOM 保护（值域 -1000~1000，越低越不易被杀）
-OOMScoreAdjust=-500
-
-# 安全加固
-PrivateTmp=yes
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-
-# 日志直写（不经 journald 缓冲，降低延迟和内存压力）
-StandardOutput=append:${LOG_DIR}/access.log
-StandardError=append:${XRAY_ERROR_LOG}
-
-[Install]
-WantedBy=multi-user.target
-UNIT_EOF
+    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
 _tpl_tunnel_systemd() {
@@ -1407,32 +1016,9 @@ _tpl_tunnel_systemd() {
 }
 
 _tpl_xray_openrc() {
-    local _ncpu; _ncpu=$(_get_cpu_count)
-    local _gogc; _gogc=$(_get_gogc_value)
-    mkdir -p "${LOG_DIR}" 2>/dev/null || true
-    cat << OPENRC_EOF
-#!/sbin/openrc-run
-description="Xray2go service"
-command="${XRAY_BIN}"
-command_args="run -c ${CONFIG_FILE}"
-command_background=true
-output_log="${LOG_DIR}/access.log"
-error_log="${XRAY_ERROR_LOG}"
-pidfile="/var/run/xray2go.pid"
-
-# 文件描述符上限
-rc_ulimit="-n 1048576"
-
-# Go 运行时调优（GOGC 自适应，非 off，防低内存 OOM）
-export GOMAXPROCS=${_ncpu}
-export GOGC=${_gogc}
-export XRAY_LOCATION_ASSET=${WORK_DIR}
-
-depend() {
-    need net
-    after firewall
-}
-OPENRC_EOF
+    mkdir -p "${WORK_DIR}/log" 2>/dev/null || true
+    printf '#!/sbin/openrc-run\ndescription="Xray2go service"\ncommand="%s"\ncommand_args="run -c %s"\ncommand_background=true\noutput_log="%s/log/xray.log"\nerror_log="%s/log/error.log"\npidfile="/var/run/xray2go.pid"\n' \
+        "${XRAY_BIN}" "${CONFIG_FILE}" "${WORK_DIR}" "${WORK_DIR}"
 }
 
 _tpl_tunnel_openrc() {
@@ -1659,9 +1245,9 @@ _exec_install_cleanup() {
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v9.0 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.0 ══════════"
     preflight_check
-    mkdir -p "${WORK_DIR}" "${LOG_DIR}" && chmod 750 "${WORK_DIR}" && chmod 755 "${LOG_DIR}"
+    mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
     # 仅提示，绝不干预系统 xray
     if _detect_existing_xray; then
@@ -1700,7 +1286,6 @@ exec_install_core() {
     }
 
     fix_time_sync
-    apply_system_tuning
     firewall_sync
 
     log_step "启动服务..."
@@ -1744,9 +1329,6 @@ exec_uninstall() {
 
     # 清理 cron（仅清理本脚本标记的条目）
     exec_remove_auto_restart
-
-    # 清理系统调优配置
-    remove_system_tuning
 
     # 清理本脚本的 pid 文件
     _cleanup_processes
@@ -2587,7 +2169,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║                  Xray-2go                ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║               Xray-2go  v8.0             ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
@@ -2627,6 +2209,8 @@ _menu_do_install() {
         [ "${_rp}" = "${_ap}" ] && \
             log_warn "Reality 端口与 Argo 回源端口相同，安装时将自动修正"
     fi
+
+    check_bbr
 
     if ! exec_install_core; then
         log_error "安装失败"
