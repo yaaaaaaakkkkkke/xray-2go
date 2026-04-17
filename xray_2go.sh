@@ -4,10 +4,6 @@
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
-#
-# 注意：本版本已移除内置网络参数调优（sysctl/ulimit/swappiness）、
-#       SWAP 自动扩展及 BBR 一键开启等功能。
-#       推荐安装完成后自行运行专业网络调优脚本以获得最佳性能。
 # ==============================================================================
 set -uo pipefail
 [ "${BASH_VERSINFO[0]}" -ge 4 ] \
