@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.2  — 海外 VPS 纯入站代理极致性能版
+# xray-2go v8.2  — 海外 VPS 纯入站代理
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
