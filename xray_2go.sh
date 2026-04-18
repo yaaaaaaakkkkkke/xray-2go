@@ -106,7 +106,6 @@ _detect_init() {
     else
         die "不支持的 init 系统（PID 1: ${_pid1_comm}，需要 systemd 或 OpenRC）"
     fi
-    log_info "Init 系统: ${_INIT_SYS}  PID1: ${_pid1_comm}"
 }
 
 is_systemd() { [ "${_INIT_SYS}" = "systemd" ]; }
@@ -336,20 +335,19 @@ _xray_health_check() {
     return 0
 }
 
+_safe_random_port() {
+    local _i=0 _p
+    while true; do
+        _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
+             || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
+        _i=$(( _i + 1 ))
+        port_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
+        [ "${_i}" -gt 30 ] && { log_error "无法在 10000-60000 中找到空闲端口"; return 1; }
+    done
+}
+
 _check_port_conflicts() {
     log_step "检测端口冲突..."
-
-    _safe_random_port() {
-        local _i=0 _p
-        while true; do
-            _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
-                 || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
-            _i=$(( _i + 1 ))
-            port_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
-            [ "${_i}" -gt 30 ] && { log_error "无法在 10000-60000 中找到空闲端口"; return 1; }
-        done
-    }
-
     local _path _cur _new
     for _path in '.argo.port' '.reality.port' '.vltcp.port'; do
         case "${_path}" in
@@ -364,7 +362,6 @@ _check_port_conflicts() {
             log_ok "端口 ${_cur} 已占用，自动分配: ${_new}"
         fi
     done
-
     if [ "$(state_get '.ff.enabled')" = "true" ] && \
        [ "$(state_get '.ff.protocol')" != "none" ] && \
        port_in_use 8080; then
@@ -469,7 +466,6 @@ fix_time_sync() {
 _STATE=""
 
 readonly _STATE_DEFAULT='{
-  "_schema": 2,
   "uuid":    "",
   "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"fixed",  "domain":null,      "token":null},
@@ -584,25 +580,7 @@ _gen_reality_sid() {
 }
 
 # ==============================================================================
-# §11 PROTOCOL — 注册表
-# ==============================================================================
-declare -A PROTOCOL_REGISTRY
-declare -A LINK_REGISTRY
-_PROTOCOL_ORDER=("argo" "ff" "reality" "vltcp")
-
-_protocol_registry_init() {
-    PROTOCOL_REGISTRY[argo]="protocol_argo"
-    PROTOCOL_REGISTRY[ff]="protocol_ff"
-    PROTOCOL_REGISTRY[reality]="protocol_reality"
-    PROTOCOL_REGISTRY[vltcp]="protocol_vltcp"
-    LINK_REGISTRY[argo]="link_argo"
-    LINK_REGISTRY[ff]="link_ff"
-    LINK_REGISTRY[reality]="link_reality"
-    LINK_REGISTRY[vltcp]="link_vltcp"
-}
-
-# ==============================================================================
-# §12 PROTOCOL — 入站配置生成
+# §11 PROTOCOL — 入站配置生成
 # ==============================================================================
 protocol_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || return 0
@@ -762,82 +740,50 @@ link_vltcp() {
 }
 
 # ==============================================================================
-# §14 CONFIG — 配置合成
+# §14 CONFIG — 配置合成与节点展示
 # ==============================================================================
 config_synthesize() {
-    local _ibs="[]" _ib _name _fn _used_keys=""
-
-    for _name in "${_PROTOCOL_ORDER[@]}"; do
-        _fn="${PROTOCOL_REGISTRY[${_name}]:-}"
-        [ -n "${_fn:-}" ] || continue
-        _ib=$("${_fn}") || { log_error "协议 ${_name} 配置生成失败"; return 1; }
+    local _ibs="[]" _ib _fn _used_keys=""
+    for _fn in protocol_argo protocol_ff protocol_reality protocol_vltcp; do
+        _ib=$("${_fn}") || { log_error "协议配置生成失败 (${_fn})"; return 1; }
         [ -n "${_ib:-}" ] || continue
-
         local _p _l _key
         _p=$(printf '%s' "${_ib}" | jq -r '.port // empty')
         _l=$(printf '%s' "${_ib}" | jq -r '.listen // "0.0.0.0"')
         _key="${_l}:${_p}"
         if printf '%s\n' ${_used_keys} | grep -qxF "${_key}"; then
-            log_error "端口冲突: ${_key} 已被占用，跳过协议 [${_name}]"
+            log_error "端口冲突: ${_key} 已被占用，跳过 [${_fn}]"
             log_error "  请在对应管理菜单中修改端口后重新应用配置"
             continue
         fi
         _used_keys="${_used_keys} ${_key}"
-
         _ibs=$(printf '%s' "${_ibs}" | jq --argjson ib "${_ib}" '. + [$ib]') \
-            || { log_error "inbounds 组装失败 (${_name})"; return 1; }
+            || { log_error "inbounds 组装失败 (${_fn})"; return 1; }
     done
-
     [ "$(printf '%s' "${_ibs}" | jq 'length')" -eq 0 ] && \
         log_warn "所有入站均已禁用，xray 将以零入站模式运行"
-
     jq -n --argjson inbounds "${_ibs}" '{
-        log: {
-            loglevel: "none",
-            access:   "none",
-            error:    "none"
-        },
+        log: { loglevel:"none", access:"none", error:"none" },
         inbounds: $inbounds,
-        outbounds: [{
-            protocol: "freedom",
-            settings: { domainStrategy: "AsIs" }
-        }],
+        outbounds: [{ protocol:"freedom", settings:{ domainStrategy:"AsIs" } }],
         policy: {
-            levels: {
-                "0": {
-                    connIdle:          300,
-                    uplinkOnly:        1,
-                    downlinkOnly:      1,
-                    statsUserUplink:   false,
-                    statsUserDownlink: false
-                }
-            },
-            system: {
-                statsInboundUplink:   false,
-                statsInboundDownlink: false
-            }
+            levels: { "0": {
+                connIdle:300, uplinkOnly:1, downlinkOnly:1,
+                statsUserUplink:false, statsUserDownlink:false
+            } },
+            system: { statsInboundUplink:false, statsInboundDownlink:false }
         }
     }' || { log_error "config JSON 合成失败"; return 1; }
 }
 
-# ==============================================================================
-# §15 CONFIG — 节点链接聚合与展示
-# ==============================================================================
-_get_share_links() {
-    local _name _fn
-    for _name in "${_PROTOCOL_ORDER[@]}"; do
-        _fn="${LINK_REGISTRY[${_name}]:-}"
-        [ -n "${_fn:-}" ] || continue
-        "${_fn}" || true
-    done
-}
-
 print_nodes() {
-    echo ""
-    local _links; _links=$(_get_share_links)
+    local _links
+    _links=$(link_argo; link_ff; link_reality; link_vltcp)
     if [ -z "${_links:-}" ]; then
+        echo ""
         log_warn "暂无可用节点（请检查 Argo 域名或服务器 IP）"; return 1
     fi
+    echo ""
     printf '%s\n' "${_links}" | while IFS= read -r _l; do
         [ -n "${_l:-}" ] && printf "${C_CYN}%s${C_RST}\n" "${_l}"
     done
@@ -1088,13 +1034,11 @@ apply_config() {
 # ==============================================================================
 # §20 RUNTIME — 安装与卸载
 # ==============================================================================
-_INSTALL_XRAY_WAS_PRESENT=0
-_INSTALL_ARGO_WAS_PRESENT=0
-
 _exec_install_cleanup() {
+    local _xray_was="${1:-0}" _argo_was="${2:-0}"
     log_warn "安装中断，回滚本次新建文件..."
-    [ "${_INSTALL_XRAY_WAS_PRESENT}" -eq 0 ] && rm -f "${XRAY_BIN}"  2>/dev/null || true
-    [ "${_INSTALL_ARGO_WAS_PRESENT}" -eq 0 ] && rm -f "${ARGO_BIN}"  2>/dev/null || true
+    [ "${_xray_was}" -eq 0 ] && rm -f "${XRAY_BIN}" 2>/dev/null || true
+    [ "${_argo_was}" -eq 0 ] && rm -f "${ARGO_BIN}" 2>/dev/null || true
     rm -f "${CONFIG_FILE}" 2>/dev/null || true
     if is_systemd; then
         rm -f /etc/systemd/system/${_SVC_XRAY}.service   2>/dev/null || true
@@ -1118,22 +1062,21 @@ exec_install_core() {
 
     _check_port_conflicts || { log_error "端口冲突无法解决，安装中止"; return 1; }
 
-    [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && \
-        _INSTALL_XRAY_WAS_PRESENT=1 || _INSTALL_XRAY_WAS_PRESENT=0
-    [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ] && \
-        _INSTALL_ARGO_WAS_PRESENT=1 || _INSTALL_ARGO_WAS_PRESENT=0
+    local _xray_was=0 _argo_was=0
+    [ -f "${XRAY_BIN}" ] && [ -x "${XRAY_BIN}" ] && _xray_was=1
+    [ -f "${ARGO_BIN}" ] && [ -x "${ARGO_BIN}" ] && _argo_was=1
 
-    download_xray        || { _exec_install_cleanup; return 1; }
+    download_xray || { _exec_install_cleanup "${_xray_was}" "${_argo_was}"; return 1; }
     [ "$(state_get '.argo.enabled')" = "true" ] && \
-        { download_cloudflared || { _exec_install_cleanup; return 1; }; }
+        { download_cloudflared || { _exec_install_cleanup "${_xray_was}" "${_argo_was}"; return 1; }; }
 
     if [ "$(state_get '.reality.enabled')" = "true" ]; then
         log_step "生成 Reality x25519 密钥对..."
-        _gen_reality_keypair || { _exec_install_cleanup; return 1; }
+        _gen_reality_keypair || { _exec_install_cleanup "${_xray_was}" "${_argo_was}"; return 1; }
         state_set '.reality.sid = $s' --arg s "$(_gen_reality_sid)"
     fi
 
-    apply_config || { _exec_install_cleanup; return 1; }
+    apply_config || { _exec_install_cleanup "${_xray_was}" "${_argo_was}"; return 1; }
 
     apply_xray_service
     [ "$(state_get '.argo.enabled')" = "true" ] && apply_tunnel_service
@@ -1151,12 +1094,12 @@ exec_install_core() {
     log_step "启动服务..."
     exec_svc enable "${_SVC_XRAY}"
     exec_svc start  "${_SVC_XRAY}" \
-        || { log_error "启动命令失败"; _exec_install_cleanup; return 1; }
+        || { log_error "启动命令失败"; _exec_install_cleanup "${_xray_was}" "${_argo_was}"; return 1; }
 
     if ! _verify_service_health "${_SVC_XRAY}" 8; then
         log_error "${_SVC_XRAY} 未正常运行，安装回滚"
         exec_svc stop "${_SVC_XRAY}" 2>/dev/null || true
-        _exec_install_cleanup
+        _exec_install_cleanup "${_xray_was}" "${_argo_was}"
         return 1
     fi
 
@@ -1223,7 +1166,6 @@ exec_uninstall() {
 # ==============================================================================
 apply_fixed_tunnel() {
     log_info "固定隧道 — 协议: $(state_get '.argo.protocol')  回源端口: $(state_get '.argo.port')"
-    echo ""
     local _domain _auth
     prompt "请输入 Argo 域名: " _domain
     case "${_domain:-}" in ''|*' '*|*'/'*|*$'\t'*)
@@ -1908,9 +1850,8 @@ manage_vltcp() {
     done
 }
 
-
 # ==============================================================================
-# §28 CLI — 主菜单
+# §27 CLI — 主菜单
 # ==============================================================================
 _menu_collect_status() {
     local _xs _cx
@@ -2017,13 +1958,12 @@ menu() {
 }
 
 # ==============================================================================
-# §29 入口
+# §28 入口
 # ==============================================================================
 main() {
     check_root
     _detect_init
     preflight_check
-    _protocol_registry_init
     state_init
     menu
 }
