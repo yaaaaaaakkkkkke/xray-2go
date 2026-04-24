@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # xray-2go v8.2  — Xray 落地代理管理脚本
-# 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP)
+# 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP/TCP-HTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
 # ==============================================================================
@@ -469,7 +469,7 @@ readonly _STATE_DEFAULT='{
   "uuid":    "",
   "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
               "mode":"fixed",  "domain":null,      "token":null},
-  "ff":      {"enabled":false, "protocol":"none", "path":"/"},
+  "ff":      {"enabled":false, "protocol":"none", "path":"/", "host":""},
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
   "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
@@ -517,6 +517,9 @@ state_merge_default() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfip = "cf.tencentapp.cn"'
     _c=$(state_get '.cfport')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.cfport = "443"'
+    # 补全 ff.host 字段（兼容旧版 state.json）
+    _c=$(state_get '.ff.host')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.ff.host = ""'
 }
 
 # ==============================================================================
@@ -627,6 +630,27 @@ protocol_ff() {
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
                     xhttpSettings:{path:$path, mode:"stream-one"}}}' ;;
+        tcphttp)
+            local _host; _host=$(state_get '.ff.host')
+            jq -n --arg uuid "${_uuid}" --arg host "${_host}" '{
+                port:8080, listen:"::", protocol:"vless",
+                settings:{clients:[{id:$uuid}], decryption:"none"},
+                streamSettings:{network:"tcp",
+                    tcpSettings:{header:{
+                        type:"http",
+                        request:{
+                            version:"1.1",
+                            method:"GET",
+                            path:["/"],
+                            headers:{
+                                Host:[$host],
+                                "User-Agent":["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
+                                "Accept-Encoding":["gzip, deflate"],
+                                Connection:["keep-alive"],
+                                Pragma:["no-cache"]
+                            }
+                        }
+                    }}}}' ;;
         *) log_error "protocol_ff: 未知协议 ${_proto}"; return 1 ;;
     esac
 }
@@ -707,6 +731,12 @@ link_ff() {
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one#FreeFlow-XHTTP\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
+        tcphttp)
+            local _henc _host
+            _host=$(state_get '.ff.host')
+            _henc=$(urlencode_path "${_host}")
+            printf 'vless://%s@%s:8080?encryption=none&security=none&type=tcp&headerType=http&host=%s&path=%%2F#FreeFlow-TCP-HTTP\n' \
+                "${_uuid}" "${_ip}" "${_henc}" ;;
     esac
 }
 
@@ -1314,12 +1344,25 @@ ask_freeflow_mode() {
     printf "  ${C_GRN}1.${C_RST} VLESS + WS\n"
     printf "  ${C_GRN}2.${C_RST} VLESS + HTTPUpgrade\n"
     printf "  ${C_GRN}3.${C_RST} VLESS + XHTTP (stream-one)\n"
-    printf "  ${C_GRN}4.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
-    local _c; prompt "请选择 (1-4，回车默认4): " _c
-    case "${_c:-4}" in
+    printf "  ${C_GRN}4.${C_RST} VLESS + TCP + HTTP 伪装（免流）\n"
+    printf "  ${C_GRN}5.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
+    local _c; prompt "请选择 (1-5，回车默认5): " _c
+    case "${_c:-5}" in
         1) state_set '.ff.enabled = true | .ff.protocol = "ws"';;
         2) state_set '.ff.enabled = true | .ff.protocol = "httpupgrade"';;
         3) state_set '.ff.enabled = true | .ff.protocol = "xhttp"';;
+        4)
+            state_set '.ff.enabled = true | .ff.protocol = "tcphttp"'
+            local _host; prompt "免流 Host（如 realname.1888.com.mo）: " _host
+            if [ -z "${_host:-}" ]; then
+                log_error "Host 不能为空，已回退到不启用"
+                state_set '.ff.enabled = false | .ff.protocol = "none"'
+                echo ""; return 0
+            fi
+            state_set '.ff.host = $h' --arg h "${_host}"
+            log_info "已选: TCP + HTTP 伪装（host=${_host}）"
+            echo ""; return 0
+            ;;
         *) state_set '.ff.enabled = false | .ff.protocol = "none"'
            log_info "不启用 FreeFlow"; echo ""; return 0;;
     esac
@@ -1563,10 +1606,11 @@ manage_argo() {
 manage_freeflow() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
     while true; do
-        local _en _proto _path
+        local _en _proto _path _host
         _en=$(state_get '.ff.enabled')
         _proto=$(state_get '.ff.protocol')
         _path=$(state_get '.ff.path')
+        _host=$(state_get '.ff.host')
 
         local _xstat
         exec_svc status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
@@ -1574,7 +1618,11 @@ manage_freeflow() {
         clear; echo ""; log_title "══ FreeFlow 管理 ══"
         if [ "${_en}" = "true" ] && [ "${_proto}" != "none" ]; then
             printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}"
-            printf "  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}  端口: 8080\n" "${_proto}" "${_path}"
+            if [ "${_proto}" = "tcphttp" ]; then
+                printf "  协议: ${C_CYN}%s${C_RST}  host: ${C_YLW}%s${C_RST}  端口: 8080\n" "${_proto}" "${_host}"
+            else
+                printf "  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}  端口: 8080\n" "${_proto}" "${_path}"
+            fi
         else
             printf "  模块: ${C_YLW}未启用${C_RST}\n"
         fi
@@ -1585,7 +1633,11 @@ manage_freeflow() {
         printf "  ${C_RED}9.${C_RST} 卸载 FreeFlow\n"
         _hr
         printf "  ${C_GRN}4.${C_RST} 变更传输协议\n"
-        printf "  ${C_GRN}5.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
+        if [ "${_proto}" = "tcphttp" ]; then
+            printf "  ${C_GRN}5.${C_RST} 修改免流 Host（当前: ${C_YLW}${_host}${C_RST}）\n"
+        else
+            printf "  ${C_GRN}5.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
+        fi
         printf "  ${C_GRN}6.${C_RST} 查看节点链接\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
@@ -1608,11 +1660,11 @@ manage_freeflow() {
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
                 firewall_sync
-                log_ok "FreeFlow 已禁用（path 配置保留）" ;;
+                log_ok "FreeFlow 已禁用（配置保留）" ;;
             3) _restart_xray_svc || true ;;
             9)
                 _confirm_uninstall "FreeFlow" || { _pause; continue; }
-                state_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/"' \
+                state_set '.ff.enabled = false | .ff.protocol = "none" | .ff.path = "/" | .ff.host = ""' \
                     || { _pause; continue; }
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
@@ -1630,13 +1682,23 @@ manage_freeflow() {
                 if [ "${_en}" != "true" ] || [ "${_proto}" = "none" ]; then
                     log_warn "请先选项 1 启用 FreeFlow"; _pause; continue
                 fi
-                local _p; prompt "新 path（回车保持 ${_path}）: " _p
-                if [ -n "${_p:-}" ]; then
-                    case "${_p}" in /*) :;; *) _p="/${_p}";; esac
-                    state_set '.ff.path = $p' --arg p "${_p}" || { _pause; continue; }
-                    apply_config  || { _pause; continue; }
-                    state_persist || log_warn "state.json 写入失败"
-                    log_ok "path 已更新: ${_p}"; print_nodes
+                if [ "${_proto}" = "tcphttp" ]; then
+                    local _h; prompt "新免流 Host（回车保持 ${_host}）: " _h
+                    if [ -n "${_h:-}" ]; then
+                        state_set '.ff.host = $h' --arg h "${_h}" || { _pause; continue; }
+                        apply_config  || { _pause; continue; }
+                        state_persist || log_warn "state.json 写入失败"
+                        log_ok "Host 已更新: ${_h}"; print_nodes
+                    fi
+                else
+                    local _p; prompt "新 path（回车保持 ${_path}）: " _p
+                    if [ -n "${_p:-}" ]; then
+                        case "${_p}" in /*) :;; *) _p="/${_p}";; esac
+                        state_set '.ff.path = $p' --arg p "${_p}" || { _pause; continue; }
+                        apply_config  || { _pause; continue; }
+                        state_persist || log_warn "state.json 写入失败"
+                        log_ok "path 已更新: ${_p}"; print_nodes
+                    fi
                 fi ;;
             6) print_nodes ;;
             0) return ;;
@@ -1865,9 +1927,19 @@ _menu_collect_status() {
             && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}]" \
             || _MENU_AD="${_as} [未配置域名]"
     else _MENU_AD="未启用"; fi
-    local _fp _fpa; _fp=$(state_get '.ff.protocol'); _fpa=$(state_get '.ff.path')
-    [ "$(state_get '.ff.enabled')" = "true" ] && [ "${_fp}" != "none" ] \
-        && _MENU_FD="${_fp} (path=${_fpa})" || _MENU_FD="未启用"
+    local _fp _fpa _ffhost
+    _fp=$(state_get '.ff.protocol')
+    _fpa=$(state_get '.ff.path')
+    _ffhost=$(state_get '.ff.host')
+    if [ "$(state_get '.ff.enabled')" = "true" ] && [ "${_fp}" != "none" ]; then
+        if [ "${_fp}" = "tcphttp" ]; then
+            _MENU_FD="${_fp} (host=${_ffhost})"
+        else
+            _MENU_FD="${_fp} (path=${_fpa})"
+        fi
+    else
+        _MENU_FD="未启用"
+    fi
     [ "$(state_get '.reality.enabled')" = "true" ] \
         && _MENU_RD="已启用 (port=$(state_get '.reality.port'), $(state_get '.reality.network'), sni=$(state_get '.reality.sni'))" \
         || _MENU_RD="未启用"
