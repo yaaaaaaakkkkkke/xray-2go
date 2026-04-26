@@ -29,7 +29,7 @@ readonly _XRAY_MIRRORS=(
     "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download"
     "https://hub.fastgit.xyz/XTLS/Xray-core/releases/download"
 )
-extra_xhttp="%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D"
+
 # ==============================================================================
 # §2  临时文件沙箱
 # ==============================================================================
@@ -709,7 +709,7 @@ link_argo() {
     case "${_proto}" in
         xhttp)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%s#Argo-XHTTP\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain} "${extra}"" ;;
+                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${extra}" ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
@@ -730,7 +730,7 @@ link_ff() {
         httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%s#FreeFlow-XHTTP\n' \
-                         "${_uuid}" "${_ip}" "${_ip}" "${_penc} "${extra}"" ;;
+                         "${_uuid}" "${_ip}" "${_ip}" "${_penc}" "${extra}" ;;
         tcphttp)
             local _henc _host
             _host=$(state_get '.ff.host')
@@ -751,7 +751,7 @@ link_reality() {
     case "${_rnet}" in
         xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%s#Reality-XHTTP\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
-                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid') "${extra}"" ;;
+                   "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" "${extra}" ;;
         *)     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
                    "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
