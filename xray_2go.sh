@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# xray-2go v8.2  — Xray 落地代理管理脚本
+# xray-2go v8.3  — Xray 落地代理管理脚本
 # 协议支持：Argo 固定隧道(WS/XHTTP) · FreeFlow(WS/HTTPUpgrade/XHTTP/TCP-HTTP)
 #           Reality(TCP/XHTTP) · VLESS-TCP 明文落地
 # 平台支持：Debian/Ubuntu (systemd) · Alpine (OpenRC)
@@ -465,6 +465,7 @@ fix_time_sync() {
 # ==============================================================================
 _STATE=""
 
+# ECH 仅用于 Argo（TLS 层），FreeFlow 无 TLS，Reality 使用自有握手，均不涉及 ECH
 readonly _STATE_DEFAULT='{
   "uuid":    "",
   "argo":    {"enabled":true,  "protocol":"ws",   "port":8888,
@@ -473,6 +474,7 @@ readonly _STATE_DEFAULT='{
   "reality": {"enabled":false, "port":443, "sni":"addons.mozilla.org",
               "network":"tcp", "pbk":null, "pvk":null, "sid":null},
   "vltcp":   {"enabled":false, "port":1234, "listen":"0.0.0.0"},
+  "ech":     {"enabled":false, "config":null},
   "cfip":    "cf.tencentapp.cn",
   "cfport":  "443"
 }'
@@ -520,6 +522,10 @@ state_merge_default() {
     # 补全 ff.host 字段（兼容旧版 state.json）
     _c=$(state_get '.ff.host')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && state_set '.ff.host = ""'
+    # 补全 ech 字段（兼容旧版 state.json）
+    _c=$(state_get '.ech')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && \
+        state_set '.ech = {"enabled":false,"config":null}'
 }
 
 # ==============================================================================
@@ -580,6 +586,70 @@ _gen_reality_sid() {
     command -v xxd    >/dev/null 2>&1 && \
         { head -c 8 /dev/urandom 2>/dev/null | xxd -p | tr -d '\n'; return; }
     od -An -N8 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# ==============================================================================
+# §10b ECH — Cloudflare Encrypted Client Hello（仅用于 Argo TLS 连接）
+# ==============================================================================
+
+# 通过 Cloudflare DoH 查询域名的 HTTPS DNS 记录，提取 ECHConfigList（base64）
+# 依赖：域名已接入 Cloudflare 并由 Cloudflare 开放 ECH
+_fetch_ech_config() {
+    local _domain="$1"
+    [ -n "${_domain:-}" ] || { log_error "域名为空，无法查询 ECH"; return 1; }
+    log_step "查询 ${_domain} 的 ECH 配置（Cloudflare DoH）..."
+
+    local _resp
+    _resp=$(curl -sfL --max-time 10 \
+        "https://cloudflare-dns.com/dns-query?name=${_domain}&type=HTTPS" \
+        -H "accept: application/dns-json" 2>/dev/null) || true
+
+    if [ -z "${_resp:-}" ]; then
+        log_error "Cloudflare DoH 查询失败，请检查网络连通性"
+        return 1
+    fi
+
+    # 提取 type=65 (HTTPS) 记录的 data 字段（取第一条）
+    local _raw
+    _raw=$(printf '%s' "${_resp}" | jq -r \
+        '[.Answer[]? | select(.type == 65) | .data] | first // empty' 2>/dev/null) || true
+
+    if [ -z "${_raw:-}" ]; then
+        log_warn "${_domain} 无 HTTPS DNS 记录（该域名可能未在 Cloudflare 上启用 ECH）"
+        return 1
+    fi
+
+    # 优先匹配带引号格式：ech="AEn..."
+    local _ech
+    _ech=$(printf '%s' "${_raw}" | grep -oE 'ech="[^"]+"' | \
+           sed 's/^ech="//;s/"$//' | head -1) || true
+
+    # fallback 无引号格式：ech=AEn...
+    if [ -z "${_ech:-}" ]; then
+        _ech=$(printf '%s' "${_raw}" | grep -oE 'ech=[A-Za-z0-9+/=]+' | \
+               sed 's/^ech=//' | head -1) || true
+    fi
+
+    if [ -z "${_ech:-}" ]; then
+        log_warn "HTTPS 记录中未包含 ech 字段（Cloudflare ECH 可能未对该域名开放）"
+        return 1
+    fi
+
+    log_ok "ECH 配置获取成功 (${_ech:0:20}...)"
+    printf '%s' "${_ech}"
+}
+
+# 刷新当前 Argo 域名的 ECH 配置并写入 state（不自动 persist，由调用方决定）
+exec_ech_refresh() {
+    local _domain; _domain=$(state_get '.argo.domain')
+    if [ -z "${_domain:-}" ] || [ "${_domain}" = "null" ]; then
+        log_error "Argo 域名未配置，无法获取 ECH 配置"; return 1
+    fi
+
+    local _cfg
+    _cfg=$(_fetch_ech_config "${_domain}") || return 1
+    state_set '.ech.config = $c' --arg c "${_cfg}" || return 1
+    log_ok "ECH 配置已写入 state"
 }
 
 # ==============================================================================
@@ -699,6 +769,18 @@ protocol_vltcp() {
 # ==============================================================================
 # §13 PROTOCOL — 节点链接生成
 # ==============================================================================
+
+# 生成 ECH URL 参数片段（&ech=...），base64 中的 +/= 需百分比编码
+# 仅在 .ech.enabled=true 且 .ech.config 不为空时返回非空字符串
+_ech_url_param() {
+    [ "$(state_get '.ech.enabled')" = "true" ] || return 0
+    local _ec; _ec=$(state_get '.ech.config')
+    [ -n "${_ec:-}" ] && [ "${_ec}" != "null" ] || return 0
+    local _ec_enc
+    _ec_enc=$(printf '%s' "${_ec}" | sed 's/+/%2B/g;s|/|%2F|g;s/=/%3D/g')
+    printf '&ech=%s' "${_ec_enc}"
+}
+
 link_argo() {
     [ "$(state_get '.argo.enabled')" = "true" ] || return 0
     local _domain _proto _uuid _cfip _cfport
@@ -706,13 +788,16 @@ link_argo() {
     _uuid=$(state_get '.uuid');          _cfip=$(state_get '.cfip')
     _cfport=$(state_get '.cfport')
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
+
+    local _ech_param; _ech_param=$(_ech_url_param)
+
     case "${_proto}" in
         xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#Argo-XHTTP\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D%s#Argo-XHTTP\n' \
+                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_ech_param}" ;;
         *)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
-                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560%s#Argo-WS\n' \
+                "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" "${_ech_param}" ;;
     esac
 }
 
@@ -1081,7 +1166,7 @@ _exec_install_cleanup() {
 }
 
 exec_install_core() {
-    clear; log_title "══════════ 安装 Xray-2go v8.2 ══════════"
+    clear; log_title "══════════ 安装 Xray-2go v8.3 ══════════"
     preflight_check
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
 
@@ -1235,6 +1320,15 @@ apply_fixed_tunnel() {
     exec_svc_reload
     exec_svc enable "${_SVC_TUNNEL}" 2>/dev/null || true
     apply_config  || return 1
+
+    # 域名已更新，如 ECH 处于启用状态则自动刷新配置
+    if [ "$(state_get '.ech.enabled')" = "true" ]; then
+        log_step "ECH 已启用，自动刷新 ECH 配置..."
+        exec_ech_refresh \
+            && log_ok "ECH 配置已同步" \
+            || log_warn "ECH 配置刷新失败，可在 [Argo 管理] 中手动刷新（选项 r）"
+    fi
+
     state_persist || log_warn "state.json 写入失败"
     exec_svc restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
@@ -1487,6 +1581,20 @@ manage_argo() {
         _proto=$(state_get '.argo.protocol')
         _port=$(state_get '.argo.port')
 
+        # ECH 状态（ECH 仅对 Argo TLS 连接有效）
+        local _ech_en _ech_disp
+        _ech_en=$(state_get '.ech.enabled')
+        if [ "${_ech_en}" = "true" ]; then
+            local _ech_cfg; _ech_cfg=$(state_get '.ech.config')
+            if [ -n "${_ech_cfg:-}" ] && [ "${_ech_cfg}" != "null" ]; then
+                _ech_disp="${C_GRN}已启用${C_RST} (${_ech_cfg:0:12}...)"
+            else
+                _ech_disp="${C_YLW}已启用（配置待获取，请选 r）${C_RST}"
+            fi
+        else
+            _ech_disp="${C_YLW}未启用${C_RST}"
+        fi
+
         clear; echo ""; log_title "══ Argo 固定隧道管理 ══"
         if [ "${_en}" = "true" ]; then
             printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_astat}"
@@ -1499,6 +1607,7 @@ manage_argo() {
         else
             printf "  模块: ${C_YLW}未启用${C_RST}\n"
         fi
+        printf "  ECH : ${_ech_disp}\n"
         _hr
         printf "  ${C_GRN}1.${C_RST} 启用 Argo\n"
         printf "  ${C_RED}2.${C_RST} 禁用 Argo\n"
@@ -1510,6 +1619,9 @@ manage_argo() {
         printf "  ${C_GRN}6.${C_RST} 修改回源端口 (当前: ${C_YLW}${_port}${C_RST})\n"
         printf "  ${C_GRN}7.${C_RST} 查看节点链接\n"
         printf "  ${C_GRN}8.${C_RST} 健康检查\n"
+        _hr
+        printf "  ${C_GRN}e.${C_RST} ECH 启用/禁用 (Encrypted Client Hello)\n"
+        printf "  ${C_GRN}r.${C_RST} 刷新 ECH 配置 (Cloudflare DoH)\n"
         printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
         local _c; prompt "请输入选择: " _c
         case "${_c:-}" in
@@ -1560,11 +1672,12 @@ manage_argo() {
                 rm -f "${ARGO_BIN}"               2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.yml"     2>/dev/null || true
                 rm -f "${WORK_DIR}/tunnel.json"    2>/dev/null || true
-                state_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed"' \
+                # 卸载 Argo 时同步清除 ECH 状态（ECH 依赖 Argo TLS）
+                state_set '.argo.enabled = false | .argo.domain = null | .argo.token = null | .argo.mode = "fixed" | .ech.enabled = false | .ech.config = null' \
                     || true
                 apply_config  || { _pause; continue; }
                 state_persist || log_warn "state.json 写入失败"
-                log_ok "Argo 已完全卸载"
+                log_ok "Argo 已完全卸载（ECH 配置已同步清除）"
                 _pause; return ;;
             4)
                 if [ "${_en}" != "true" ]; then
@@ -1594,6 +1707,41 @@ manage_argo() {
             6) exec_update_argo_port ;;
             7) print_nodes ;;
             8) check_argo_health || true ;;
+            e)
+                # ECH 切换：启用/禁用
+                if [ "${_ech_en}" = "true" ]; then
+                    state_set '.ech.enabled = false' || { _pause; continue; }
+                    state_persist || log_warn "state.json 写入失败"
+                    log_ok "ECH 已禁用"
+                else
+                    # 前置检查：Argo 必须已启用且已配置域名
+                    if [ "${_en}" != "true" ]; then
+                        log_warn "请先选项 1 启用 Argo 后再启用 ECH"; _pause; continue
+                    fi
+                    local _d; _d=$(state_get '.argo.domain')
+                    if [ -z "${_d:-}" ] || [ "${_d}" = "null" ]; then
+                        log_warn "请先选项 4 配置 Argo 域名后再启用 ECH"; _pause; continue
+                    fi
+                    # 拉取 ECH 配置
+                    local _cfg
+                    _cfg=$(_fetch_ech_config "${_d}") || { _pause; continue; }
+                    state_set '.ech.enabled = true | .ech.config = $c' --arg c "${_cfg}" \
+                        || { _pause; continue; }
+                    state_persist || log_warn "state.json 写入失败"
+                    log_ok "ECH 已启用，节点链接已包含 ech 参数"
+                    print_nodes
+                fi ;;
+            r)
+                # 手动刷新 ECH 配置（不要求 ECH 已启用，方便预拉取）
+                local _d; _d=$(state_get '.argo.domain')
+                if [ -z "${_d:-}" ] || [ "${_d}" = "null" ]; then
+                    log_warn "请先选项 4 配置 Argo 域名"; _pause; continue
+                fi
+                exec_ech_refresh \
+                    && { state_persist || log_warn "state.json 写入失败"
+                         log_ok "ECH 配置已刷新"
+                         [ "${_ech_en}" = "true" ] && print_nodes || true; } \
+                    || log_error "ECH 配置刷新失败" ;;
             0) return ;;
             *) log_error "无效选项" ;;
         esac
@@ -1913,7 +2061,7 @@ manage_vltcp() {
 }
 
 # ==============================================================================
-# §27 CLI — 主菜单
+# §28 CLI — 主菜单
 # ==============================================================================
 _menu_collect_status() {
     local _xs _cx
@@ -1923,9 +2071,11 @@ _menu_collect_status() {
     local _as; _as=$(check_argo)
     local _dom; _dom=$(state_get '.argo.domain')
     if [ "$(state_get '.argo.enabled')" = "true" ]; then
+        local _ech_tag=""
+        [ "$(state_get '.ech.enabled')" = "true" ] && _ech_tag=" +ECH"
         [ -n "${_dom:-}" ] && [ "${_dom}" != "null" ] \
-            && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}]" \
-            || _MENU_AD="${_as} [未配置域名]"
+            && _MENU_AD="${_as} [$(state_get '.argo.protocol'), ${_dom}${_ech_tag}]" \
+            || _MENU_AD="${_as} [未配置域名${_ech_tag}]"
     else _MENU_AD="未启用"; fi
     local _fp _fpa _ffhost
     _fp=$(state_get '.ff.protocol')
@@ -1951,7 +2101,7 @@ _menu_collect_status() {
 _menu_render() {
     clear; echo ""
     printf "${C_BOLD}${C_PUR}  ╔══════════════════════════════════════════╗${C_RST}\n"
-    printf "${C_BOLD}${C_PUR}  ║                Xray-2go  v8.2            ║${C_RST}\n"
+    printf "${C_BOLD}${C_PUR}  ║                Xray-2go  v8.3            ║${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ╠══════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Xray     : ${_MENU_XC}%-29s${C_RST}${C_PUR} ${C_RST}\n"  "${_MENU_XS}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n"  "${_MENU_AD}"
@@ -2030,7 +2180,7 @@ menu() {
 }
 
 # ==============================================================================
-# §28 入口
+# §29 入口
 # ==============================================================================
 main() {
     check_root
