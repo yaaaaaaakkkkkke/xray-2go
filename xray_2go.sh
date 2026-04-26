@@ -29,7 +29,7 @@ readonly _XRAY_MIRRORS=(
     "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download"
     "https://hub.fastgit.xyz/XTLS/Xray-core/releases/download"
 )
-
+extra_xhttp="%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D"
 # ==============================================================================
 # §2  临时文件沙箱
 # ==============================================================================
