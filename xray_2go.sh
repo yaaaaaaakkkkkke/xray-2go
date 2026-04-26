@@ -708,7 +708,7 @@ link_argo() {
     [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
     case "${_proto}" in
         xhttp)
-            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D#Argo-XHTTP\n' \
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=xhttp&host=%s&path=%%2Fargo&mode=auto&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#Argo-XHTTP\n' \
                 "${_uuid}" "${_cfip}" "${_cfport}" "${_domain}" "${_domain}" ;;
         *)
             printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=firefox&type=ws&host=%s&path=%%2Fargo%%3Fed%%3D2560#Argo-WS\n' \
@@ -729,7 +729,7 @@ link_ff() {
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         httpupgrade) printf 'vless://%s@%s:8080?encryption=none&security=none&type=httpupgrade&host=%s&path=%s#FreeFlow-HTTPUpgrade\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
-        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D#FreeFlow-XHTTP\n' \
+        xhttp)       printf 'vless://%s@%s:8080?encryption=none&security=none&type=xhttp&host=%s&path=%s&mode=stream-one&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#FreeFlow-XHTTP\n' \
                          "${_uuid}" "${_ip}" "${_ip}" "${_penc}" ;;
         tcphttp)
             local _henc _host
@@ -749,7 +749,7 @@ link_reality() {
     local _rnet _uuid
     _rnet=$(state_get '.reality.network'); _rnet="${_rnet:-tcp}"; _uuid=$(state_get '.uuid')
     case "${_rnet}" in
-        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%7B%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingKey%22%3A%22_Luckylos%22%7D#Reality-XHTTP\n' \
+        xhttp) printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F&mode=stream-one&extra=%%7B%%22xPaddingObfsMode%%22%%3Atrue%%2C%%22xPaddingMethod%%22%%3A%%22tokenish%%22%%2C%%22xPaddingPlacement%%22%%3A%%22queryInHeader%%22%%2C%%22xPaddingHeader%%22%%3A%%22X-Cache%%22%%2C%%22xPaddingKey%%22%%3A%%22_Luckylos%%22%%7D#Reality-XHTTP\n' \
                    "${_uuid}" "${_ip}" "$(state_get '.reality.port')" \
                    "$(state_get '.reality.sni')" "${_rpbk}" "$(state_get '.reality.sid')" ;;
         *)     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#Reality-Vision\n' \
