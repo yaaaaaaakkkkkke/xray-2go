@@ -596,7 +596,7 @@ protocol_argo() {
                 port:$port, listen:"127.0.0.1", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
-                    xhttpSettings:{path:"/argo", mode:"auto"}}}' ;;
+                    xhttpSettings:{path:"/argo", mode:"auto", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" '{
                 port:$port, listen:"127.0.0.1", protocol:"vless",
@@ -629,7 +629,7 @@ protocol_ff() {
                 port:8080, listen:"::", protocol:"vless",
                 settings:{clients:[{id:$uuid}], decryption:"none"},
                 streamSettings:{network:"xhttp",
-                    xhttpSettings:{path:$path, mode:"stream-one"}}}' ;;
+                    xhttpSettings:{path:$path, mode:"stream-one", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
         tcphttp)
             local _host; _host=$(state_get '.ff.host')
             jq -n --arg uuid "${_uuid}" --arg host "${_host}" '{
@@ -674,7 +674,7 @@ protocol_reality() {
                 streamSettings:{network:"xhttp", security:"reality",
                     realitySettings:{dest:($sni+":443"),
                         serverNames:[$sni], privateKey:$pvk, shortIds:[$sid]},
-                    xhttpSettings:{path:"/", mode:"auto"}}}' ;;
+                    xhttpSettings:{path:"/", mode:"auto", xPaddingObfsMode: true, xPaddingMethod: "tokenish", xPaddingPlacement: "queryInHeader", xPaddingHeader: "X-Cache", xPaddingKey: "_Luckylos"}}}' ;;
         *)
             jq -n --argjson port "${_port}" --arg uuid "${_uuid}" \
                    --arg sni "${_sni}" --arg pvk "${_pvk}" --arg sid "${_sid}" '{
