@@ -924,21 +924,32 @@ _build_tunnel_cmd() {
 }
 
 _gen_argo_config() {
-    local _domain="$1" _tid="$2" _cred="$3"
-    local _port; _port=$(state_get '.argo.port')
-    {
-        printf 'tunnel: %s\n' "${_tid}"
-        printf 'credentials-file: %s\n' "${_cred}"
-        printf '\n'
-        printf 'ingress:\n'
-        printf '  - hostname: %s\n' "${_domain}"
-        printf '    service: http://localhost:%s\n' "${_port}"
-        printf '    originRequest:\n'
-        printf '      connectTimeout: 30s\n'
-        printf '      noTLSVerify: true\n'
-        printf '  - service: http_status:404\n'
-    } > "${WORK_DIR}/tunnel.yml" || { log_error "tunnel.yml 写入失败"; return 1; }
-    log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port})"
+ local _domain="$1" _tid="$2" _cred="$3"
+ local _port; _port=$(state_get '.argo.port')
+ {
+ printf 'tunnel: %s\n' "${_tid}"
+ printf 'credentials-file: %s\n' "${_cred}"
+ printf '\n'
+ printf 'ingress:\n'
+ printf ' - hostname: %s\n' "${_domain}"
+ printf ' service: http://localhost:%s\n' "${_port}"
+ printf ' originRequest:\n'
+ printf ' connectTimeout: 30s\n'
+ printf ' noTLSVerify: true\n'
+ printf ' - service: http_status:404\n'
+ } > "${WORK_DIR}/tunnel.yml" || { log_error "tunnel.yml 写入失败"; return 1; }
+ log_ok "tunnel.yml 已生成 (${_domain} → localhost:${_port})"
+}
+
+# 若 tunnel.yml 存在，用最新 state 中的端口重新生成（端口变更后需同步）
+_regen_tunnel_yml() {
+ [ -f "${WORK_DIR}/tunnel.yml" ] || return 0
+ local _domain _tid
+ _domain=$(state_get '.argo.domain')
+ _tid=$(jq -r 'if (.TunnelID? // "") != "" then .TunnelID elif (.AccountTag? // "") != "" then .AccountTag else empty end' "${WORK_DIR}/tunnel.json" 2>/dev/null) || true
+ [ -n "${_domain:-}" ] && [ -n "${_tid:-}" ] \
+ && _gen_argo_config "${_domain}" "${_tid}" "${WORK_DIR}/tunnel.json" \
+ || log_warn "tunnel.yml 端口同步跳过：缺少 domain/tid"
 }
 
 # ==============================================================================
@@ -1272,6 +1283,7 @@ exec_update_uuid() {
 
 exec_update_argo_port() {
 	local _p; _p=$(_input_port '.argo.port') || return 1
+	_regen_tunnel_yml
 	apply_config || return 1
 	apply_tunnel_service; exec_svc_reload
 	exec_svc restart "${_SVC_TUNNEL}" || log_warn "tunnel 重启失败，请手动重启"
