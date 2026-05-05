@@ -1646,6 +1646,23 @@ acme_issue_ok_or_existing() {
     return 1
 }
 
+acme_timeout_run() {
+    local _seconds="${1:-600}"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${_seconds}" "$@"
+    else
+        "$@"
+    fi
+}
+
+acme_retry_wait() {
+    local _attempt="$1" _max="$2"
+    [ "${_attempt}" -lt "${_max}" ] || return 1
+    log_warn "ACME 签发失败或超时，30 秒后重试..."
+    sleep 30
+}
+
 acme_issue_cf_token() {
     local _domain="$1" _token="$2" _zone="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
@@ -1661,15 +1678,19 @@ CF_Zone_ID='${_zone}'
 export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "DNS-01 签发证书（Cloudflare Token）..."
-    local _issue_out _issue_rc
-    _issue_out=$(CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
-        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
-    _issue_rc=$?
-    printf '%s\n' "${_issue_out}"
-    if [ "${_issue_rc}" -ne 0 ]; then
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "DNS-01 签发失败"; return 1; }
-    fi
+    log_step "DNS-01 签发证书（Cloudflare Token，最多 2 次，每次 10 分钟超时）..."
+    local _issue_out _issue_rc _attempt
+    for _attempt in 1 2; do
+        log_info "ACME 尝试 ${_attempt}/2"
+        _issue_out=$(CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
+            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+        _issue_rc=$?
+        printf '%s\n' "${_issue_out}"
+        [ "${_issue_rc}" -eq 0 ] && break
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
+        acme_retry_wait "${_attempt}" 2 || true
+    done
+    [ "${_issue_rc}" -eq 0 ] || { log_error "DNS-01 签发失败；请检查 Cloudflare 凭证、域名是否在该账号下、DNS API 权限，以及系统时间"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_token"
 }
 
@@ -1691,15 +1712,19 @@ CF_Email='${_cf_email}'
 export CF_Key CF_Email
 " || { log_error "ACME 凭证写入失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "DNS-01 签发证书（Cloudflare Global Key）..."
-    local _issue_out _issue_rc
-    _issue_out=$(CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
-        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
-    _issue_rc=$?
-    printf '%s\n' "${_issue_out}"
-    if [ "${_issue_rc}" -ne 0 ]; then
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "DNS-01 签发失败"; return 1; }
-    fi
+    log_step "DNS-01 签发证书（Cloudflare Global Key，最多 2 次，每次 10 分钟超时）..."
+    local _issue_out _issue_rc _attempt
+    for _attempt in 1 2; do
+        log_info "ACME 尝试 ${_attempt}/2"
+        _issue_out=$(CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
+            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+        _issue_rc=$?
+        printf '%s\n' "${_issue_out}"
+        [ "${_issue_rc}" -eq 0 ] && break
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
+        acme_retry_wait "${_attempt}" 2 || true
+    done
+    [ "${_issue_rc}" -eq 0 ] || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及系统时间"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_key"
 }
 
@@ -1733,14 +1758,18 @@ acme_issue_http01() {
     acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "HTTP-01 standalone 签发证书..."
-    local _issue_out _issue_rc
-    _issue_out=$("${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" 2>&1)
-    _issue_rc=$?
-    printf '%s\n' "${_issue_out}"
-    if [ "${_issue_rc}" -ne 0 ]; then
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "HTTP-01 签发失败"; return 1; }
-    fi
+    log_step "HTTP-01 standalone 签发证书（最多 2 次，每次 10 分钟超时）..."
+    local _issue_out _issue_rc _attempt
+    for _attempt in 1 2; do
+        log_info "ACME 尝试 ${_attempt}/2"
+        _issue_out=$(acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" 2>&1)
+        _issue_rc=$?
+        printf '%s\n' "${_issue_out}"
+        [ "${_issue_rc}" -eq 0 ] && break
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
+        acme_retry_wait "${_attempt}" 2 || true
+    done
+    [ "${_issue_rc}" -eq 0 ] || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only、系统时间"; return 1; }
     acme_install_cert "${_domain}" "http01"
 }
 
