@@ -1720,14 +1720,37 @@ acme_issue_with_ca_fallback() {
     return 1
 }
 
-acme_issue_cf_token() {
-    local _domain="$1" _token="$2" _zone="$3" _email="${4:-}"
+acme_cf_find_zone() {
+    local _domain="$1" _token="$2" _name _resp _zone_id _zone_name
     val_domain "${_domain}" >/dev/null || return 1
     [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
-    [ -n "${_zone:-}" ]  || { log_error "Cloudflare Zone ID 不能为空"; return 1; }
+    case "${_token}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare API Token 含非法字符"; return 1;; esac
+
+    _name="${_domain}"
+    while [ -n "${_name:-}" ] && [ "${_name#*.}" != "${_name}" ]; do
+        _resp=$(curl -fsS -H "Authorization: Bearer ${_token}" \
+            "https://api.cloudflare.com/client/v4/zones?name=${_name}&status=active&per_page=1" 2>/dev/null) || true
+        _zone_id=$(printf '%s' "${_resp:-}" | jq -r 'if .success == true and (.result|length) > 0 then .result[0].id else empty end' 2>/dev/null) || true
+        _zone_name=$(printf '%s' "${_resp:-}" | jq -r 'if .success == true and (.result|length) > 0 then .result[0].name else empty end' 2>/dev/null) || true
+        if [ -n "${_zone_id:-}" ] && [ -n "${_zone_name:-}" ]; then
+            case "${_zone_id}" in *[!A-Za-z0-9_-]*) log_error "Cloudflare 返回的 Zone ID 格式不合法"; return 1;; esac
+            log_info "已自动识别 Cloudflare Zone: ${_zone_name} (${_zone_id})" >&2
+            printf '%s' "${_zone_id}"
+            return 0
+        fi
+        _name="${_name#*.}"
+    done
+    log_error "无法通过 Cloudflare API 自动识别 ${_domain} 的 Zone ID；请确认 Token 具备 Zone:Read 权限且域名已托管在 Cloudflare"
+    return 1
+}
+
+acme_issue_cf_token() {
+    local _domain="$1" _token="$2" _email="${3:-}" _zone
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
     [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
     case "${_token}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare API Token 含非法字符"; return 1;; esac
-    case "${_zone}" in *[!A-Za-z0-9_-]*) log_error "Cloudflare Zone ID 格式不合法"; return 1;; esac
+    _zone=$(acme_cf_find_zone "${_domain}" "${_token}") || return 1
     acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
@@ -1736,7 +1759,7 @@ export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
     log_step "DNS-01 签发证书（Cloudflare Token；按 Let's Encrypt → ZeroSSL 轮换）..."
     acme_issue_with_ca_fallback "${_domain}" "${_email}" token "${_token}" "${_zone}" dns_cf \
-        || { log_error "DNS-01 签发失败；请检查 Cloudflare Token/Zone ID、域名是否在该账号下、DNS API 权限，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
+        || { log_error "DNS-01 签发失败；请检查 Cloudflare Token 权限（Zone:Read + DNS:Edit）、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_token"
 }
 
@@ -1824,10 +1847,9 @@ vlquic_config_cert() {
             prompt "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
             acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1 ;;
         2)
-            local _token _zone
-            prompt "Cloudflare API Token（不会显示在节点/日志中）: " _token
-            prompt "Cloudflare Zone ID: " _zone
-            acme_issue_cf_token "${_domain}" "${_token}" "${_zone}" "${_email}" || return 1 ;;
+            local _token
+            prompt "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
+            acme_issue_cf_token "${_domain}" "${_token}" "${_email}" || return 1 ;;
         3)
             log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
             acme_issue_http01 "${_domain}" "${_email}" || return 1 ;;
