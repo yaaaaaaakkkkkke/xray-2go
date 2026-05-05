@@ -1705,10 +1705,12 @@ export CF_Key CF_Email
 
 acme_install_cert() {
     local _domain="$1" _method="${2:-manual}"
+    # 证书安装阶段只落盘证书，不重启 xray2go。
+    # 调用方随后会写入 vlquic state、合成 config，再由 config_apply 统一重启。
+    # 若此处提前 restart，服务会加载旧配置，可能中断当前 SSH/代理连接且模块未完成启用。
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
         --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
         --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
-        --reloadcmd "systemctl restart ${_SVC_XRAY} >/dev/null 2>&1 || true" \
         || { log_error "证书安装失败"; return 1; }
     chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
     chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
