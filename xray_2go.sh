@@ -1607,20 +1607,23 @@ _module_disable_commit() {
 # ACME certificate automation for VLESS-XHTTP-H3
 # ==============================================================================
 acme_install() {
+    local _email="${1:-}"
     if [ -x "${HOME}/.acme.sh/acme.sh" ]; then
         return 0
     fi
+    [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
     log_step "安装 acme.sh..."
-    curl -fsSL https://get.acme.sh | sh -s email=admin@example.com >/dev/null 2>&1 \
+    curl -fsSL https://get.acme.sh | sh -s email="${_email}" >/dev/null 2>&1 \
         || { log_error "acme.sh 安装失败"; return 1; }
 }
 
 acme_issue_cf() {
-    local _domain="$1" _token="$2" _zone="$3"
+    local _domain="$1" _token="$2" _zone="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
     [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
     [ -n "${_zone:-}" ]  || { log_error "Cloudflare Zone ID 不能为空"; return 1; }
-    acme_install || return 1
+    [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
+    acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
 CF_Zone_ID='${_zone}'
@@ -1646,13 +1649,14 @@ CF_Zone_ID='${_zone}'
 }
 
 acme_issue_http01() {
-    local _domain="$1"
+    local _domain="$1" _email="${2:-}"
     val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
     if port_mgr_in_use 80; then
         log_error "80/tcp 已被占用，无法使用 HTTP-01 standalone"
         return 1
     fi
-    acme_install || return 1
+    acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "HTTP-01 standalone 签发证书..."
@@ -1674,22 +1678,28 @@ acme_issue_http01() {
 
 vlquic_config_cert() {
     echo ""; log_title "VLESS-XHTTP-H3 证书配置"
-    local _domain; prompt "入口域名（需 DNS only 直连 VPS）: " _domain
+    local _domain _email; prompt "入口域名（需 DNS only 直连 VPS）: " _domain
     _domain=$(val_domain "${_domain}") || return 1
     echo ""
     printf "  ${C_GRN}1.${C_RST} Cloudflare DNS-01 ${C_YLW}[推荐，不占用80端口]${C_RST}\n"
     printf "  ${C_GRN}2.${C_RST} HTTP-01 standalone ${C_YLW}[简单，需要80端口]${C_RST}\n"
     printf "  ${C_GRN}3.${C_RST} 使用已有证书文件\n"
     local _m; prompt "请选择 (1-3，回车默认1): " _m
+    if [ "${_m:-1}" != "3" ]; then
+        prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email
+        case "${_email:-}" in
+            *@example.com|*@example.org|*@example.net|''|*' '*) log_error "ACME 邮箱不合法"; return 1 ;;
+        esac
+    fi
     case "${_m:-1}" in
         1)
             local _token _zone
             prompt "Cloudflare API Token（不会显示在节点/日志中）: " _token
             prompt "Cloudflare Zone ID: " _zone
-            acme_issue_cf "${_domain}" "${_token}" "${_zone}" ;;
+            acme_issue_cf "${_domain}" "${_token}" "${_zone}" "${_email}" || return 1 ;;
         2)
             log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
-            acme_issue_http01 "${_domain}" ;;
+            acme_issue_http01 "${_domain}" "${_email}" || return 1 ;;
         3)
             local _cert _key
             prompt "fullchain.pem 路径: " _cert
