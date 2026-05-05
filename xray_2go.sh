@@ -1608,13 +1608,30 @@ _module_disable_commit() {
 # ==============================================================================
 acme_install() {
     local _email="${1:-}"
-    if [ -x "${HOME}/.acme.sh/acme.sh" ]; then
-        return 0
-    fi
     [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
-    log_step "安装 acme.sh..."
-    curl -fsSL https://get.acme.sh | sh -s email="${_email}" >/dev/null 2>&1 \
-        || { log_error "acme.sh 安装失败"; return 1; }
+    if [ ! -x "${HOME}/.acme.sh/acme.sh" ]; then
+        log_step "安装 acme.sh..."
+        curl -fsSL https://get.acme.sh | sh -s email="${_email}" >/dev/null 2>&1 \
+            || { log_error "acme.sh 安装失败"; return 1; }
+    fi
+    acme_update_account_email "${_email}"
+}
+
+acme_update_account_email() {
+    local _email="$1" _account_conf="${HOME}/.acme.sh/account.conf"
+    [ -x "${HOME}/.acme.sh/acme.sh" ] || return 1
+    if [ -f "${_account_conf}" ] && grep -q "^ACCOUNT_EMAIL=.*example\.com" "${_account_conf}" 2>/dev/null; then
+        log_warn "检测到旧 ACME 账户邮箱为 example.com，正在更新账户邮箱..."
+    fi
+    "${HOME}/.acme.sh/acme.sh" --update-account --accountemail "${_email}" >/dev/null 2>&1 || true
+    if [ -f "${_account_conf}" ]; then
+        local _tmp
+        _tmp=$(tmp_file "acme_account_XXXXXX") || return 0
+        grep -v '^ACCOUNT_EMAIL=' "${_account_conf}" > "${_tmp}" 2>/dev/null || true
+        printf "ACCOUNT_EMAIL='%s'\n" "${_email}" >> "${_tmp}"
+        mv "${_tmp}" "${_account_conf}" 2>/dev/null || true
+        chmod 600 "${_account_conf}" 2>/dev/null || true
+    fi
 }
 
 acme_issue_cf() {
@@ -1632,7 +1649,7 @@ CF_Zone_ID='${_zone}'
     . "${_ACME_ENV_FILE}"
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "DNS-01 签发证书（Cloudflare）..."
-    "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 \
+    "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
         || { log_error "DNS-01 签发失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
         --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
@@ -1660,7 +1677,7 @@ acme_issue_http01() {
     mkdir -p "${_CERT_DIR}/${_domain}"
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "HTTP-01 standalone 签发证书..."
-    "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 \
+    "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" \
         || { log_error "HTTP-01 签发失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
         --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
@@ -1688,8 +1705,9 @@ vlquic_config_cert() {
     if [ "${_m:-1}" != "3" ]; then
         prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email
         case "${_email:-}" in
-            *@example.com|*@example.org|*@example.net|''|*' '*) log_error "ACME 邮箱不合法"; return 1 ;;
+            *@example.com|*@example.org|*@example.net|''|*' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "ACME 邮箱不合法"; return 1 ;;
         esac
+        printf '%s' "${_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'             || { log_error "ACME 邮箱格式不合法"; return 1; }
     fi
     case "${_m:-1}" in
         1)
