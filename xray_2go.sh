@@ -2941,10 +2941,10 @@ manage_vlquic() {
                     vlquic_config_cert || { _pause; continue; }
                 fi
                 st_set '.vlquic.enabled = true' || { _pause; continue; }
-                config_apply || { st_set '.vlquic.enabled = false'; _pause; continue; }
                 st_persist || log_warn "state.json 写入失败"
                 fw_reconcile
-                log_ok "VLESS-XHTTP-H3 已启用 (UDP/${_port})"; config_print_nodes ;;
+                config_apply || { st_set '.vlquic.enabled = false'; st_persist || true; fw_reconcile; _pause; continue; }
+                log_ok "VLESS-XHTTP-H3 已启用 (UDP/$(port_of vlquic))"; config_print_nodes ;;
             2)
                 [ "${_en}" != "true" ] && { log_info "VLESS-XHTTP-H3 已禁用"; _pause; continue; }
                 st_set '.vlquic.enabled = false' || { _pause; continue; }
@@ -2972,9 +2972,8 @@ manage_vlquic() {
                 fi ;;
             6)
                 vlquic_config_cert || { _pause; continue; }
-                [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
                 st_persist || log_warn "state.json 写入失败"
-                [ "${_en}" = "true" ] && config_print_nodes ;;
+                [ "${_en}" = "true" ] && { fw_reconcile; config_apply || { _pause; continue; }; config_print_nodes; } ;;
             7) config_print_nodes ;;
             0) return ;;
             *) log_error "无效选项" ;;
