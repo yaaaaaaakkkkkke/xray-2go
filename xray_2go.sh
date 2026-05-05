@@ -2,7 +2,7 @@
 # ==============================================================================
 # xray-2go — 插件化代理管理脚本
 # 安全基线：输入校验 · 敏感文件保护 · 原子写入 · 服务互斥 · 可回滚清理
-# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP（均以插件形式加载）
+# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP · VLESS-XHTTP-H3（均以插件形式加载）
 # 平台支持：Debian/Ubuntu/RHEL系 (systemd) · Alpine (OpenRC；Argo/cloudflared 需用户预装官方 cloudflared)
 # ==============================================================================
 set -uo pipefail  # 交互菜单使用显式返回值处理，避免 set -e 造成误退出
@@ -28,6 +28,8 @@ readonly _CONFIG_HASH_FILE="${WORK_DIR}/.config.sha256"
 readonly _SYSCTL_FILE="/etc/sysctl.d/99-xray2go.conf"
 readonly _HOSTS_BAK="${WORK_DIR}/.hosts.bak"
 readonly _ARGO_ENV_FILE="${WORK_DIR}/.argo_env"
+readonly _ACME_ENV_FILE="${WORK_DIR}/.acme_env"
+readonly _CERT_DIR="${WORK_DIR}/certs"
 
 readonly _SVC_XRAY="xray2go"
 readonly _SVC_TUNNEL="tunnel2go"
@@ -232,6 +234,24 @@ port_mgr_in_use() {
         /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
+port_mgr_in_use_udp() {
+    local _p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ulnH 2>/dev/null | awk -v p="${_p}" \
+            'BEGIN{r=0}{split($4,a,":");if(a[length(a)]==p){r=1;exit}}END{exit !r}'
+        return $?
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -ulnp 2>/dev/null | awk -v p="${_p}" \
+            'BEGIN{r=0}{split($4,a,":");if(a[length(a)]==p){r=1;exit}}END{exit !r}'
+        return $?
+    fi
+    local _hex; _hex=$(printf '%04X' "${_p}")
+    awk -v h="${_hex}" \
+        'NR>1{n=split($2,a,":");if(a[n]==h){found=1;exit}}END{exit !found}' \
+        /proc/net/udp /proc/net/udp6 2>/dev/null
+}
+
 port_mgr_random() {
     local _i=0 _p
     while true; do
@@ -256,7 +276,8 @@ readonly _STATE_DEFAULT='{
     "argo":    18888,
     "ff":      8080,
     "reality": 443,
-    "vltcp":   1234
+    "vltcp":   1234,
+    "vlquic":  443
   },
   "argo": {
     "enabled":  true,
@@ -282,6 +303,14 @@ readonly _STATE_DEFAULT='{
   "vltcp": {
     "enabled": false,
     "listen":  "0.0.0.0"
+  },
+  "vlquic": {
+    "enabled": false,
+    "listen":  "0.0.0.0",
+    "domain":  "",
+    "cert":    "",
+    "key":     "",
+    "acme_method": "manual"
   },
   "xpad": {
     "argo":    true,
@@ -392,7 +421,7 @@ xpad_of() {
 # 统一端口读取接口（单一数据源）
 # 所有模块禁止硬编码端口，必须调用此函数
 port_of() {
-    # 用法：port_of argo / ff / reality / vltcp
+    # 用法：port_of argo / ff / reality / vltcp / vlquic
     local _v; _v=$(st_get ".ports.${1}")
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
@@ -464,16 +493,17 @@ st_persist() { with_lock _st_persist_inner; }
 _st_normalize_schema() {
 
     # 规范化端口字段到顶层 ports
-    local _ap _rp _vp _fp
+    local _ap _rp _vp _qp _fp
     _ap=$(st_get '.argo.port    // empty')
     _rp=$(st_get '.reality.port // empty')
     _vp=$(st_get '.vltcp.port   // empty')
+    _qp=$(st_get '.vlquic.port  // empty')
     _fp=$(st_get '.ff.port      // empty')
 
     # 若 .ports 不存在则初始化
     local _ports; _ports=$(st_get '.ports')
     if [ -z "${_ports:-}" ] || [ "${_ports}" = "null" ]; then
-        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234}'
+        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443}'
     fi
 
     # 将分散端口字段归一到 .ports（仅当字段存在且非默认值时）
@@ -486,6 +516,9 @@ _st_normalize_schema() {
     [ -n "${_vp:-}" ] && [ "${_vp}" != "null" ] && {
         st_set '.ports.vltcp = ($p|tonumber)' --arg p "${_vp}"
         st_set 'del(.vltcp.port)' 2>/dev/null || true; }
+    [ -n "${_qp:-}" ] && [ "${_qp}" != "null" ] && {
+        st_set '.ports.vlquic = ($p|tonumber)' --arg p "${_qp}"
+        st_set 'del(.vlquic.port)' 2>/dev/null || true; }
     [ -n "${_fp:-}" ] && [ "${_fp}" != "null" ] && {
         st_set '.ports.ff = ($p|tonumber)' --arg p "${_fp}"
         st_set 'del(.ff.port)' 2>/dev/null || true; }
@@ -500,6 +533,8 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.reality = 443'
     _c=$(st_get '.ports.vltcp')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vltcp = 1234'
+    _c=$(st_get '.ports.vlquic')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vlquic = 443'
 
     _c=$(st_get '.reality.network')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
@@ -528,6 +563,16 @@ _st_normalize_schema() {
         st_set '.xpad.reality = true'
     _c=$(st_get '.vltcp.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vltcp.listen = "0.0.0.0"'
+    _c=$(st_get '.vlquic.listen')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.listen = "0.0.0.0"'
+    _c=$(st_get '.vlquic.domain')
+    { [ "${_c}" = "null" ]; } && st_set '.vlquic.domain = ""'
+    _c=$(st_get '.vlquic.cert')
+    { [ "${_c}" = "null" ]; } && st_set '.vlquic.cert = ""'
+    _c=$(st_get '.vlquic.key')
+    { [ "${_c}" = "null" ]; } && st_set '.vlquic.key = ""'
+    _c=$(st_get '.vlquic.acme_method')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.acme_method = "manual"'
     _c=$(st_get '.ff.path')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.path = "/"'
     _c=$(st_get '.ff.protocol')
@@ -611,6 +656,7 @@ plugin_install_builtins() {
     _plugin_write_ff
     _plugin_write_reality
     _plugin_write_vltcp
+    _plugin_write_vlquic
 }
 
 # ==============================================================================
@@ -917,18 +963,82 @@ PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/vltcp.sh"
 }
 
+_plugin_write_vlquic() {
+cat > "${PLUGIN_DIR}/vlquic.sh" << 'PLUGIN_EOF'
+# xray-2go plugin: vlquic (VLESS + XHTTP stream-one H3)
+
+_plg_vlquic_enabled() {
+    [ "$(st_get '.vlquic.enabled')" = "true" ]
+}
+
+_plg_vlquic_ports() {
+    _plg_vlquic_enabled || return 0
+    printf '%s/udp\n' "$(port_of vlquic)"
+}
+
+_plg_vlquic_inbound() {
+    _plg_vlquic_enabled || return 0
+    local _port _listen _uuid _domain _cert _key
+    _port=$(port_of vlquic)
+    _listen=$(st_get '.vlquic.listen')
+    _uuid=$(st_get '.uuid')
+    _domain=$(st_get '.vlquic.domain')
+    _cert=$(st_get '.vlquic.cert')
+    _key=$(st_get '.vlquic.key')
+    [ -n "${_domain:-}" ] && [ -n "${_cert:-}" ] && [ -n "${_key:-}" ] || {
+        log_error "VLESS-XHTTP-H3 缺少域名或证书路径"; return 1; }
+    jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
+          --arg domain "${_domain}" --arg cert "${_cert}" --arg key "${_key}" '{
+        port:$port, listen:$listen, protocol:"vless",
+        settings:{clients:[{id:$uuid}], decryption:"none"},
+        streamSettings:{
+            network:"xhttp",
+            security:"tls",
+            tlsSettings:{serverName:$domain, alpn:["h3"], certificates:[{certificateFile:$cert, keyFile:$key}]},
+            xhttpSettings:{path:"/", mode:"stream-one", extra:{xhttpModeH3:true}}
+        }}'
+}
+
+_plg_vlquic_link() {
+    _plg_vlquic_enabled || return 0
+    local _domain _uuid _port
+    _domain=$(st_get '.vlquic.domain')
+    _uuid=$(st_get '.uuid')
+    _port=$(port_of vlquic)
+    [ -n "${_domain:-}" ] || return 0
+    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%%2F&mode=stream-one&xhttpModeH3=true#VLESS-XHTTP-H3\n' \
+        "${_uuid}" "${_domain}" "${_port}" "${_domain}" "${_domain}"
+}
+PLUGIN_EOF
+    chmod 644 "${PLUGIN_DIR}/vlquic.sh"
+}
+
 # ==============================================================================
 # Firewall reconciliation
 # ==============================================================================
 
-# 汇总所有插件的期望端口（无硬编码端口）
-fw_desired_ports() {
-    local _name _p
+# 汇总所有插件的期望防火墙规则（格式：port/proto）
+fw_desired_rules() {
+    local _name _p _port _proto
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         _p=$(plugin_call "${_name}" ports 2>/dev/null) || true
-        [ -n "${_p:-}" ] && printf '%s\n' "${_p}"
-    done | grep -E '^[0-9]+$' | sort -un
+        [ -n "${_p:-}" ] || continue
+        while IFS= read -r _p; do
+            [ -n "${_p:-}" ] || continue
+            case "${_p}" in
+                */udp) _port=${_p%/*}; _proto=udp ;;
+                */tcp) _port=${_p%/*}; _proto=tcp ;;
+                *)     _port=${_p};    _proto=tcp ;;
+            esac
+            printf '%s' "${_port}" | grep -qE '^[0-9]+$' || continue
+            printf '%s/%s\n' "${_port}" "${_proto}"
+        done <<EOF
+${_p}
+EOF
+    done | sort -u
 }
+
+fw_desired_ports() { fw_desired_rules | cut -d/ -f1 | sort -un; }
 
 _fw_read_managed() {
     grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null | sort -un || true
@@ -1043,24 +1153,25 @@ _fw_close_port() {
 fw_reconcile() {
     log_step "同步防火墙规则..."
     mkdir -p "${WORK_DIR}"
-    local _expected _managed _p
-    _expected=$(fw_desired_ports)
-    _managed=$(_fw_read_managed)
-    for _p in ${_managed}; do
-        printf '%s\n' ${_expected} | grep -qx "${_p}" || {
-            local _rule _rp _rb _rproto
-            for _rule in $(_fw_read_managed_rules | grep -E ":${_p}/tcp$" || true); do
-                _rb=${_rule%%:*}
-                _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
-                _fw_close_port "${_rp}" "${_rproto}" "${_rb}"
-            done
-        }
+    local _expected_rules _expected_ports _rule _rp _rb _rproto _want
+    _expected_rules=$(fw_desired_rules)
+    _expected_ports=$(printf '%s\n' ${_expected_rules} | cut -d/ -f1 | grep -E '^[0-9]+$' | sort -un || true)
+
+    for _rule in $(_fw_read_managed_rules); do
+        _rb=${_rule%%:*}
+        _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
+        _want="${_rp}/${_rproto}"
+        printf '%s\n' ${_expected_rules} | grep -qx "${_want}" || \
+            _fw_close_port "${_rp}" "${_rproto}" "${_rb}"
     done
-    for _p in ${_expected}; do
-        _fw_open_port "${_p}" tcp
+
+    for _rule in ${_expected_rules}; do
+        _rp=${_rule%/*}; _rproto=${_rule#*/}
+        _fw_open_port "${_rp}" "${_rproto}"
     done
-    if [ -n "${_expected:-}" ]; then
-        printf '%s\n' ${_expected} > "${_FW_PORTS_FILE}" 2>/dev/null || true
+
+    if [ -n "${_expected_ports:-}" ]; then
+        printf '%s\n' ${_expected_ports} > "${_FW_PORTS_FILE}" 2>/dev/null || true
     else
         rm -f "${_FW_PORTS_FILE}" "${_FW_RULES_FILE}" 2>/dev/null || true
     fi
@@ -1089,6 +1200,10 @@ $(port_of reality)"
     if [ "$(st_get '.vltcp.enabled')" = "true" ]; then
         _ports="${_ports}
 $(port_of vltcp)"
+    fi
+    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
+        _ports="${_ports}
+$(port_of vlquic)"
     fi
     local _uniq _rule _rp _rb _rproto
     _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
@@ -1485,6 +1600,107 @@ _module_disable_commit() {
     # fw_reconcile 根据当前启用插件重新计算期望端口，并删除 .fw_ports 中不再期望的规则。
     fw_reconcile
     log_info "${_name} 防火墙端口已从托管规则中删除"
+}
+
+
+# ==============================================================================
+# ACME certificate automation for VLESS-XHTTP-H3
+# ==============================================================================
+acme_install() {
+    if [ -x "${HOME}/.acme.sh/acme.sh" ]; then
+        return 0
+    fi
+    log_step "安装 acme.sh..."
+    curl -fsSL https://get.acme.sh | sh -s email=admin@example.com >/dev/null 2>&1 \
+        || { log_error "acme.sh 安装失败"; return 1; }
+}
+
+acme_issue_cf() {
+    local _domain="$1" _token="$2" _zone="$3"
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
+    [ -n "${_zone:-}" ]  || { log_error "Cloudflare Zone ID 不能为空"; return 1; }
+    acme_install || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
+CF_Zone_ID='${_zone}'
+" || { log_error "ACME 凭证写入失败"; return 1; }
+    # shellcheck disable=SC1090
+    . "${_ACME_ENV_FILE}"
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    log_step "DNS-01 签发证书（Cloudflare）..."
+    "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 \
+        || { log_error "DNS-01 签发失败"; return 1; }
+    "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
+        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
+        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
+        --reloadcmd "systemctl restart ${_SVC_XRAY} >/dev/null 2>&1 || true" \
+        || { log_error "证书安装失败"; return 1; }
+    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
+    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
+    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
+    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "dns_cf"' \
+        --arg d "${_domain}" \
+        --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
+        --arg k "${_CERT_DIR}/${_domain}/privkey.pem"
+}
+
+acme_issue_http01() {
+    local _domain="$1"
+    val_domain "${_domain}" >/dev/null || return 1
+    if port_mgr_in_use 80; then
+        log_error "80/tcp 已被占用，无法使用 HTTP-01 standalone"
+        return 1
+    fi
+    acme_install || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    log_step "HTTP-01 standalone 签发证书..."
+    "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 \
+        || { log_error "HTTP-01 签发失败"; return 1; }
+    "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
+        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
+        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
+        --reloadcmd "systemctl restart ${_SVC_XRAY} >/dev/null 2>&1 || true" \
+        || { log_error "证书安装失败"; return 1; }
+    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
+    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
+    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
+    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "http01"' \
+        --arg d "${_domain}" \
+        --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
+        --arg k "${_CERT_DIR}/${_domain}/privkey.pem"
+}
+
+vlquic_config_cert() {
+    echo ""; log_title "VLESS-XHTTP-H3 证书配置"
+    local _domain; prompt "入口域名（需 DNS only 直连 VPS）: " _domain
+    _domain=$(val_domain "${_domain}") || return 1
+    echo ""
+    printf "  ${C_GRN}1.${C_RST} Cloudflare DNS-01 ${C_YLW}[推荐，不占用80端口]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} HTTP-01 standalone ${C_YLW}[简单，需要80端口]${C_RST}\n"
+    printf "  ${C_GRN}3.${C_RST} 使用已有证书文件\n"
+    local _m; prompt "请选择 (1-3，回车默认1): " _m
+    case "${_m:-1}" in
+        1)
+            local _token _zone
+            prompt "Cloudflare API Token（不会显示在节点/日志中）: " _token
+            prompt "Cloudflare Zone ID: " _zone
+            acme_issue_cf "${_domain}" "${_token}" "${_zone}" ;;
+        2)
+            log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
+            acme_issue_http01 "${_domain}" ;;
+        3)
+            local _cert _key
+            prompt "fullchain.pem 路径: " _cert
+            prompt "privkey.pem 路径: " _key
+            [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
+            [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
+            st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "manual"' \
+                --arg d "${_domain}" --arg c "${_cert}" --arg k "${_key}" ;;
+        *) log_error "无效选项"; return 1 ;;
+    esac
+    log_ok "证书配置完成: ${_domain}"
 }
 
 # ==============================================================================
@@ -2106,6 +2322,36 @@ ask_vltcp_mode() {
     echo ""
 }
 
+
+ask_vlquic_mode() {
+    echo ""; log_title "VLESS-XHTTP-H3（UDP/QUIC）"
+    printf "  ${C_GRN}1.${C_RST} 启用 VLESS-XHTTP-H3\n"
+    printf "  ${C_GRN}2.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
+    local _c; prompt "请选择 (1-2，回车默认2): " _c
+    case "${_c:-2}" in
+        1) st_set '.vlquic.enabled = true';;
+        *) st_set '.vlquic.enabled = false'; log_info "不启用 VLESS-XHTTP-H3"; echo ""; return 0;;
+    esac
+
+    local _dp; _dp=$(port_of vlquic)
+    local _vp; prompt "UDP 监听端口（回车默认 ${_dp}）: " _vp
+    if [ -n "${_vp:-}" ]; then
+        if val_port "${_vp}" >/dev/null 2>&1; then
+            st_set '.ports.vlquic = ($p|tonumber)' --arg p "${_vp}"
+        else
+            log_warn "端口无效，使用默认值 ${_dp}"
+        fi
+    fi
+    port_mgr_in_use_udp "$(port_of vlquic)" && log_warn "UDP/$(port_of vlquic) 已被占用"
+
+    local _dl; _dl=$(st_get '.vlquic.listen')
+    local _vl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _vl
+    [ -n "${_vl:-}" ] && { _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; _vl="${_dl}"; }; st_set '.vlquic.listen = $l' --arg l "${_vl}"; }
+    vlquic_config_cert || { st_set '.vlquic.enabled = false'; return 1; }
+    log_info "VLESS-XHTTP-H3 配置完成 — UDP端口:$(port_of vlquic) 域名:$(st_get '.vlquic.domain')"
+    echo ""
+}
+
 ask_xpad_mode() {
     local _target="${1:-all}" _label="${2:-全部 XHTTP}"
     echo ""; log_title "${_label} xPadding 混淆"
@@ -2571,6 +2817,87 @@ manage_vltcp() {
     done
 }
 
+
+# ── VLESS-XHTTP-H3 管理 ────────────────────────────────────────────────────────
+
+manage_vlquic() {
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
+    while true; do
+        local _en _port _listen _domain _method _xstat
+        _en=$(     st_get '.vlquic.enabled')
+        _port=$(   port_of vlquic)
+        _listen=$( st_get '.vlquic.listen')
+        _domain=$( st_get '.vlquic.domain')
+        _method=$( st_get '.vlquic.acme_method')
+        svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
+
+        clear; echo ""; log_title "══ VLESS-XHTTP-H3 / QUIC 管理 ══"
+        [ "${_en}" = "true" ] \
+            && printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}" \
+            || printf "  模块: ${C_YLW}未启用${C_RST}\n"
+        printf "  端口: ${C_YLW}%s/udp${C_RST}  监听: ${C_CYN}%s${C_RST}\n" "${_port}" "${_listen}"
+        printf "  域名: ${C_CYN}%s${C_RST}  证书: ${C_YLW}%s${C_RST}\n" "${_domain:-未配置}" "${_method:-manual}"
+        _hr
+        printf "  ${C_GRN}1.${C_RST} 启用 VLESS-XHTTP-H3\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 VLESS-XHTTP-H3\n"
+        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 VLESS-XHTTP-H3\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 修改 UDP 端口（当前: ${C_YLW}${_port}${C_RST}）\n"
+        printf "  ${C_GRN}5.${C_RST} 修改监听地址（当前: ${C_CYN}${_listen}${C_RST}）\n"
+        printf "  ${C_GRN}6.${C_RST} 配置/重新签发证书\n"
+        printf "  ${C_GRN}7.${C_RST} 查看节点链接\n"
+        printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
+        local _c; prompt "请输入选择: " _c
+        case "${_c:-}" in
+            1)
+                [ "${_en}" = "true" ] && { log_info "VLESS-XHTTP-H3 已启用"; _pause; continue; }
+                if [ -z "${_domain:-}" ] || [ "${_domain}" = "null" ] || [ ! -f "$(st_get '.vlquic.cert')" ] || [ ! -f "$(st_get '.vlquic.key')" ]; then
+                    vlquic_config_cert || { _pause; continue; }
+                fi
+                st_set '.vlquic.enabled = true' || { _pause; continue; }
+                config_apply || { st_set '.vlquic.enabled = false'; _pause; continue; }
+                st_persist || log_warn "state.json 写入失败"
+                fw_reconcile
+                log_ok "VLESS-XHTTP-H3 已启用 (UDP/${_port})"; config_print_nodes ;;
+            2)
+                [ "${_en}" != "true" ] && { log_info "VLESS-XHTTP-H3 已禁用"; _pause; continue; }
+                st_set '.vlquic.enabled = false' || { _pause; continue; }
+                _module_disable_commit VLESS-XHTTP-H3 || { _pause; continue; }
+                log_ok "VLESS-XHTTP-H3 已禁用" ;;
+            3) svc_restart_xray || true ;;
+            9)
+                _menu_confirm_uninstall "VLESS-XHTTP-H3" || { _pause; continue; }
+                st_set '.vlquic.enabled = false | .vlquic.listen = "0.0.0.0" | .vlquic.domain = "" | .vlquic.cert = "" | .vlquic.key = "" | .vlquic.acme_method = "manual"' || { _pause; continue; }
+                st_set '.ports.vlquic = 443'
+                _module_disable_commit VLESS-XHTTP-H3 || { _pause; continue; }
+                log_ok "VLESS-XHTTP-H3 已卸载"; _pause; return ;;
+            4)
+                local _np; _menu_input_port '.ports.vlquic' _np || { _pause; continue; }
+                _commit_port_change vlquic "${_np}/udp" || { _pause; continue; } ;;
+            5)
+                local _l; prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
+                if [ -n "${_l:-}" ]; then
+                    _l=$(val_listen_addr "${_l}") || { _pause; continue; }
+                    st_set '.vlquic.listen = $l' --arg l "${_l}" || { _pause; continue; }
+                    [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                    st_persist || log_warn "state.json 写入失败"
+                    log_ok "监听地址已更新: ${_l}"
+                    [ "${_en}" = "true" ] && config_print_nodes
+                fi ;;
+            6)
+                vlquic_config_cert || { _pause; continue; }
+                [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                st_persist || log_warn "state.json 写入失败"
+                [ "${_en}" = "true" ] && config_print_nodes ;;
+            7) config_print_nodes ;;
+            0) return ;;
+            *) log_error "无效选项" ;;
+        esac
+        _pause
+    done
+}
+
 # ── 主菜单 ────────────────────────────────────────────────────────────────────
 
 _menu_collect_status() {
@@ -2606,6 +2933,10 @@ _menu_collect_status() {
     [ "$(st_get '.vltcp.enabled')" = "true" ] \
         && _MENU_VD="已启用 (port=$(port_of vltcp), listen=$(st_get '.vltcp.listen'))" \
         || _MENU_VD="未启用"
+
+    [ "$(st_get '.vlquic.enabled')" = "true" ] \
+        && _MENU_QD="已启用 (udp=$(port_of vlquic), domain=$(st_get '.vlquic.domain'))" \
+        || _MENU_QD="未启用"
 }
 
 _menu_render() {
@@ -2617,6 +2948,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Argo     : %-29s${C_PUR} ${C_RST}\n" "${_MENU_AD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Reality  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_RD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  VLESS-TCP: %-29s${C_PUR} ${C_RST}\n" "${_MENU_VD}"
+    printf "${C_BOLD}${C_PUR}  ║${C_RST}  XHTTP-H3 : %-29s${C_PUR} ${C_RST}\n" "${_MENU_QD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 安装 Xray-2go\n"
@@ -2624,9 +2956,10 @@ _menu_render() {
     printf "  ${C_GRN}3.${C_RST} Argo 管理\n"
     printf "  ${C_GRN}4.${C_RST} Reality 管理\n"
     printf "  ${C_GRN}5.${C_RST} VLESS-TCP 管理\n"
-    printf "  ${C_GRN}6.${C_RST} FreeFlow 管理\n"; _hr
-    printf "  ${C_GRN}7.${C_RST} 查看节点\n"
-    printf "  ${C_GRN}8.${C_RST} 修改 UUID\n"
+    printf "  ${C_GRN}6.${C_RST} VLESS-XHTTP-H3 管理\n"
+    printf "  ${C_GRN}7.${C_RST} FreeFlow 管理\n"; _hr
+    printf "  ${C_GRN}8.${C_RST} 查看节点\n"
+    printf "  ${C_GRN}9.${C_RST} 修改 UUID\n"
     printf "  ${C_GRN}s.${C_RST} 快捷方式/脚本更新\n"; _hr
     printf "  ${C_RED}0.${C_RST} 退出\n\n"
 }
@@ -2641,6 +2974,7 @@ _menu_do_install() {
     ask_freeflow_mode
     ask_reality_mode
     ask_vltcp_mode
+    ask_vlquic_mode
 
     if [ "$(st_get '.argo.enabled')" = "true" ] && [ "$(st_get '.argo.protocol')" = "xhttp" ]; then
         ask_xpad_mode argo Argo
@@ -2655,6 +2989,10 @@ _menu_do_install() {
     if [ "$(st_get '.reality.enabled')" = "true" ]; then
         [ "$(port_of reality)" = "$(port_of argo)" ] && \
             log_warn "Reality 端口与 Argo 回源端口相同，安装时将自动修正"
+    fi
+    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
+        port_mgr_in_use_udp "$(port_of vlquic)" && \
+            log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
     fi
 
     if ! exec_install; then
@@ -2671,25 +3009,26 @@ _menu_do_install() {
 
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD=""
+    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD=""
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请输入选择 (0-8/s): " _c; echo ""
+        local _c; prompt "请输入选择 (0-9/s): " _c; echo ""
         case "${_c:-}" in
             1) _menu_do_install ;;
             2) exec_uninstall ;;
             3) manage_argo ;;
             4) manage_reality ;;
             5) manage_vltcp ;;
-            6) manage_freeflow ;;
-            7) [ "${_MENU_CX}" -eq 0 ] && config_print_nodes \
+            6) manage_vlquic ;;
+            7) manage_freeflow ;;
+            8) [ "${_MENU_CX}" -eq 0 ] && config_print_nodes \
                     || log_warn "Xray-2go 未安装或未运行" ;;
-            8) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
+            9) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
                     || log_warn "请先安装 Xray-2go" ;;
             s) exec_update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-8 或 s" ;;
+            *) log_error "无效选项，请输入 0-9 或 s" ;;
         esac
         _pause
     done
