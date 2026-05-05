@@ -1657,7 +1657,9 @@ acme_timeout_run() {
 }
 
 acme_ca_list() {
-    printf '%s\n' letsencrypt google zerossl
+    # Google Trust Services ACME requires External Account Binding for new accounts.
+    # Without EAB credentials it is not suitable for unattended fallback.
+    printf '%s\n' letsencrypt zerossl
 }
 
 acme_ca_label() {
@@ -1710,8 +1712,11 @@ acme_issue_with_ca_fallback() {
         fi
         log_warn "${_label} 签发失败，切换下一个 CA"
     done
-    printf '%s\n' "${_last_out}" | grep -qE 'curl: \\(28\\)|Cannot init API' \
-        && log_error "所有 CA 均失败；检测到 ACME API 网络不可达/超时，请检查 VPS 到 CA 的 443 出站连通性"
+    if printf '%s\n' "${_last_out}" | grep -qE 'retryafter=86400|too large \(> 600\)'; then
+        log_error "CA 已接受验证但订单处理要求等待 86400 秒；请稍后重试，或切换其它 CA/手动证书"
+    elif printf '%s\n' "${_last_out}" | grep -qE 'curl: \\(28\\)|Cannot init API'; then
+        log_error "所有 CA 均失败；检测到 ACME API 网络不可达/超时，请检查 VPS 到 CA 的 443 出站连通性"
+    fi
     return 1
 }
 
@@ -1729,7 +1734,7 @@ acme_issue_cf_token() {
 CF_Zone_ID='${_zone}'
 export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    log_step "DNS-01 签发证书（Cloudflare Token；按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    log_step "DNS-01 签发证书（Cloudflare Token；按 Let's Encrypt → ZeroSSL 轮换）..."
     acme_issue_with_ca_fallback "${_domain}" "${_email}" token "${_token}" "${_zone}" dns_cf \
         || { log_error "DNS-01 签发失败；请检查 Cloudflare Token/Zone ID、域名是否在该账号下、DNS API 权限，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_token"
@@ -1752,7 +1757,7 @@ acme_issue_cf_key() {
 CF_Email='${_cf_email}'
 export CF_Key CF_Email
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    log_step "DNS-01 签发证书（Cloudflare Global Key；按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    log_step "DNS-01 签发证书（Cloudflare Global Key；按 Let's Encrypt → ZeroSSL 轮换）..."
     acme_issue_with_ca_fallback "${_domain}" "${_email}" key "${_cf_key}" "${_cf_email}" dns_cf \
         || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_key"
@@ -1787,7 +1792,7 @@ acme_issue_http01() {
     fi
     acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
-    log_step "HTTP-01 standalone 签发证书（按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    log_step "HTTP-01 standalone 签发证书（按 Let's Encrypt → ZeroSSL 轮换）..."
     acme_issue_with_ca_fallback "${_domain}" "${_email}" none "" "" http01 \
         || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "http01"
