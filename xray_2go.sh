@@ -1750,7 +1750,9 @@ vlquic_config_cert() {
     _domain=$(val_domain "${_domain}") || return 1
     echo ""
     printf "  ${C_GRN}1.${C_RST} Cloudflare Global API Key ${C_YLW}[简单]${C_RST}\n"
+    printf "     获取链接: https://dash.cloudflare.com/profile/api-tokens\n"
     printf "  ${C_GRN}2.${C_RST} Cloudflare API Token ${C_YLW}[最小权限推荐]${C_RST}\n"
+    printf "     创建链接: https://dash.cloudflare.com/profile/api-tokens\n"
     printf "  ${C_GRN}3.${C_RST} HTTP-01 standalone ${C_YLW}[需要80端口]${C_RST}\n"
     printf "  ${C_GRN}4.${C_RST} 使用已有证书文件\n"
     local _m; prompt "请选择 (1-4，回车默认1): " _m
