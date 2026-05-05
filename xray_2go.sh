@@ -1640,18 +1640,23 @@ acme_issue_cf() {
     [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
     [ -n "${_zone:-}" ]  || { log_error "Cloudflare Zone ID 不能为空"; return 1; }
     [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
+    case "${_token}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare API Token 含非法字符"; return 1;; esac
+    case "${_zone}" in *[!A-Za-z0-9_-]*) log_error "Cloudflare Zone ID 格式不合法"; return 1;; esac
     acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
 CF_Zone_ID='${_zone}'
 export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    # shellcheck disable=SC1090
-    . "${_ACME_ENV_FILE}"
-    export CF_Token CF_Zone_ID
+    export CF_Token="${_token}"
+    export CF_Zone_ID="${_zone}"
+    export CF_Account_ID=""
+    export CF_Key=""
+    export CF_Email=""
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "DNS-01 签发证书（Cloudflare）..."
-    "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
+    CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
+        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
         || { log_error "DNS-01 签发失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
         --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
