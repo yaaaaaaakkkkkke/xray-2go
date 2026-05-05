@@ -1634,7 +1634,7 @@ acme_update_account_email() {
     fi
 }
 
-acme_issue_cf() {
+acme_issue_cf_token() {
     local _domain="$1" _token="$2" _zone="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
     [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
@@ -1648,16 +1648,40 @@ acme_issue_cf() {
 CF_Zone_ID='${_zone}'
 export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    export CF_Token="${_token}"
-    export CF_Zone_ID="${_zone}"
-    export CF_Account_ID=""
-    export CF_Key=""
-    export CF_Email=""
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "DNS-01 签发证书（Cloudflare）..."
+    log_step "DNS-01 签发证书（Cloudflare Token）..."
     CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
         "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
         || { log_error "DNS-01 签发失败"; return 1; }
+    acme_install_cert "${_domain}" "dns_cf_token"
+}
+
+acme_issue_cf_key() {
+    local _domain="$1" _cf_key="$2" _cf_email="$3" _email="${4:-}"
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_cf_key:-}" ]   || { log_error "Cloudflare Global API Key 不能为空"; return 1; }
+    [ -n "${_cf_email:-}" ] || { log_error "Cloudflare 账号邮箱不能为空"; return 1; }
+    [ -n "${_email:-}" ]    || { log_error "ACME 邮箱不能为空"; return 1; }
+    case "${_cf_key}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare Global API Key 含非法字符"; return 1;; esac
+    case "${_cf_email}" in *' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "Cloudflare 账号邮箱不合法"; return 1;; esac
+    printf '%s' "${_cf_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
+        || { log_error "Cloudflare 账号邮箱格式不合法"; return 1; }
+    acme_install "${_email}" || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    atomic_write_secret "${_ACME_ENV_FILE}" "CF_Key='${_cf_key}'
+CF_Email='${_cf_email}'
+export CF_Key CF_Email
+" || { log_error "ACME 凭证写入失败"; return 1; }
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    log_step "DNS-01 签发证书（Cloudflare Global Key）..."
+    CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
+        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
+        || { log_error "DNS-01 签发失败"; return 1; }
+    acme_install_cert "${_domain}" "dns_cf_key"
+}
+
+acme_install_cert() {
+    local _domain="$1" _method="${2:-manual}"
     "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
         --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
         --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
@@ -1666,10 +1690,11 @@ export CF_Token CF_Zone_ID
     chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
     chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
     chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
-    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "dns_cf"' \
+    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = $m' \
         --arg d "${_domain}" \
         --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --arg k "${_CERT_DIR}/${_domain}/privkey.pem"
+        --arg k "${_CERT_DIR}/${_domain}/privkey.pem" \
+        --arg m "${_method}"
 }
 
 acme_issue_http01() {
@@ -1705,11 +1730,12 @@ vlquic_config_cert() {
     local _domain _email; prompt "入口域名（需 DNS only 直连 VPS）: " _domain
     _domain=$(val_domain "${_domain}") || return 1
     echo ""
-    printf "  ${C_GRN}1.${C_RST} Cloudflare DNS-01 ${C_YLW}[推荐，不占用80端口]${C_RST}\n"
-    printf "  ${C_GRN}2.${C_RST} HTTP-01 standalone ${C_YLW}[简单，需要80端口]${C_RST}\n"
-    printf "  ${C_GRN}3.${C_RST} 使用已有证书文件\n"
-    local _m; prompt "请选择 (1-3，回车默认1): " _m
-    if [ "${_m:-1}" != "3" ]; then
+    printf "  ${C_GRN}1.${C_RST} Cloudflare Global API Key ${C_YLW}[简单]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} Cloudflare API Token ${C_YLW}[最小权限推荐]${C_RST}\n"
+    printf "  ${C_GRN}3.${C_RST} HTTP-01 standalone ${C_YLW}[需要80端口]${C_RST}\n"
+    printf "  ${C_GRN}4.${C_RST} 使用已有证书文件\n"
+    local _m; prompt "请选择 (1-4，回车默认1): " _m
+    if [ "${_m:-1}" != "4" ]; then
         prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email
         case "${_email:-}" in
             *@example.com|*@example.org|*@example.net|''|*' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "ACME 邮箱不合法"; return 1 ;;
@@ -1718,14 +1744,19 @@ vlquic_config_cert() {
     fi
     case "${_m:-1}" in
         1)
+            local _cf_key _cf_email
+            prompt "Cloudflare 账号邮箱: " _cf_email
+            prompt "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
+            acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1 ;;
+        2)
             local _token _zone
             prompt "Cloudflare API Token（不会显示在节点/日志中）: " _token
             prompt "Cloudflare Zone ID: " _zone
-            acme_issue_cf "${_domain}" "${_token}" "${_zone}" "${_email}" || return 1 ;;
-        2)
+            acme_issue_cf_token "${_domain}" "${_token}" "${_zone}" "${_email}" || return 1 ;;
+        3)
             log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
             acme_issue_http01 "${_domain}" "${_email}" || return 1 ;;
-        3)
+        4)
             local _cert _key
             prompt "fullchain.pem 路径: " _cert
             prompt "privkey.pem 路径: " _key
