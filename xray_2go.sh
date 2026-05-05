@@ -1656,11 +1656,63 @@ acme_timeout_run() {
     fi
 }
 
-acme_retry_wait() {
-    local _attempt="$1" _max="$2"
-    [ "${_attempt}" -lt "${_max}" ] || return 1
-    log_warn "ACME 签发失败或超时，30 秒后重试..."
-    sleep 30
+acme_ca_list() {
+    printf '%s\n' letsencrypt google zerossl
+}
+
+acme_ca_label() {
+    case "${1:-}" in
+        letsencrypt) printf "Let's Encrypt" ;;
+        google)      printf 'Google Trust Services' ;;
+        zerossl)     printf 'ZeroSSL' ;;
+        *)           printf '%s' "$1" ;;
+    esac
+}
+
+acme_issue_with_ca_fallback() {
+    local _domain="$1" _email="$2" _auth_mode="$3" _auth_a="${4:-}" _auth_b="${5:-}" _issue_mode="${6:-dns_cf}"
+    local _ca _label _issue_out _issue_rc _last_out=""
+    for _ca in $(acme_ca_list); do
+        _label=$(acme_ca_label "${_ca}")
+        log_step "ACME CA: ${_label}"
+        "${HOME}/.acme.sh/acme.sh" --set-default-ca --server "${_ca}" >/dev/null 2>&1 || true
+        case "${_issue_mode}" in
+            dns_cf)
+                case "${_auth_mode}" in
+                    token)
+                        _issue_out=$(CF_Token="${_auth_a}" CF_Zone_ID="${_auth_b}" CF_Account_ID="" CF_Key="" CF_Email="" \
+                            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+                        ;;
+                    key)
+                        _issue_out=$(CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_auth_a}" CF_Email="${_auth_b}" \
+                            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+                        ;;
+                    *)
+                        log_error "未知 Cloudflare 认证模式: ${_auth_mode}"; return 1 ;;
+                esac
+                ;;
+            http01)
+                _issue_out=$(acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" 2>&1)
+                ;;
+            *)
+                log_error "未知 ACME 签发模式: ${_issue_mode}"; return 1 ;;
+        esac
+        _issue_rc=$?
+        _last_out="${_issue_out}"
+        printf '%s\n' "${_issue_out}"
+        if [ "${_issue_rc}" -eq 0 ]; then
+            log_ok "${_label} 签发成功"
+            return 0
+        fi
+        if acme_issue_ok_or_existing "${_domain}" "${_issue_out}"; then
+            log_ok "${_label} 已有证书可复用"
+            return 0
+        fi
+        log_warn "${_label} 签发失败，切换下一个 CA"
+    done
+    printf '%s\n' "${_last_out}" | grep -qE 'curl: \\(28\\)|Cannot init API' \
+        && log_error "所有 CA 均失败；检测到 ACME API 网络不可达/超时，请检查 VPS 到 CA 的 443 出站连通性"
+    return 1
 }
 
 acme_issue_cf_token() {
@@ -1677,20 +1729,9 @@ acme_issue_cf_token() {
 CF_Zone_ID='${_zone}'
 export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "DNS-01 签发证书（Cloudflare Token，最多 2 次，每次 10 分钟超时）..."
-    local _issue_out _issue_rc _attempt
-    for _attempt in 1 2; do
-        log_info "ACME 尝试 ${_attempt}/2"
-        _issue_out=$(CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
-            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
-        _issue_rc=$?
-        printf '%s\n' "${_issue_out}"
-        [ "${_issue_rc}" -eq 0 ] && break
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
-        acme_retry_wait "${_attempt}" 2 || true
-    done
-    [ "${_issue_rc}" -eq 0 ] || { log_error "DNS-01 签发失败；请检查 Cloudflare 凭证、域名是否在该账号下、DNS API 权限，以及系统时间"; return 1; }
+    log_step "DNS-01 签发证书（Cloudflare Token；按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" token "${_token}" "${_zone}" dns_cf \
+        || { log_error "DNS-01 签发失败；请检查 Cloudflare Token/Zone ID、域名是否在该账号下、DNS API 权限，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_token"
 }
 
@@ -1711,20 +1752,9 @@ acme_issue_cf_key() {
 CF_Email='${_cf_email}'
 export CF_Key CF_Email
 " || { log_error "ACME 凭证写入失败"; return 1; }
-    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "DNS-01 签发证书（Cloudflare Global Key，最多 2 次，每次 10 分钟超时）..."
-    local _issue_out _issue_rc _attempt
-    for _attempt in 1 2; do
-        log_info "ACME 尝试 ${_attempt}/2"
-        _issue_out=$(CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
-            acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
-        _issue_rc=$?
-        printf '%s\n' "${_issue_out}"
-        [ "${_issue_rc}" -eq 0 ] && break
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
-        acme_retry_wait "${_attempt}" 2 || true
-    done
-    [ "${_issue_rc}" -eq 0 ] || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及系统时间"; return 1; }
+    log_step "DNS-01 签发证书（Cloudflare Global Key；按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" key "${_cf_key}" "${_cf_email}" dns_cf \
+        || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_key"
 }
 
@@ -1757,19 +1787,9 @@ acme_issue_http01() {
     fi
     acme_install "${_email}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
-    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    log_step "HTTP-01 standalone 签发证书（最多 2 次，每次 10 分钟超时）..."
-    local _issue_out _issue_rc _attempt
-    for _attempt in 1 2; do
-        log_info "ACME 尝试 ${_attempt}/2"
-        _issue_out=$(acme_timeout_run 600 "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" 2>&1)
-        _issue_rc=$?
-        printf '%s\n' "${_issue_out}"
-        [ "${_issue_rc}" -eq 0 ] && break
-        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" && { _issue_rc=0; break; }
-        acme_retry_wait "${_attempt}" 2 || true
-    done
-    [ "${_issue_rc}" -eq 0 ] || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only、系统时间"; return 1; }
+    log_step "HTTP-01 standalone 签发证书（按 Let's Encrypt → Google Trust Services → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" none "" "" http01 \
+        || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "http01"
 }
 
