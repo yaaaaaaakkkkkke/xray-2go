@@ -1634,6 +1634,18 @@ acme_update_account_email() {
     fi
 }
 
+acme_issue_ok_or_existing() {
+    local _domain="$1" _out="${2:-}"
+    if [ -n "${_out:-}" ] && printf '%s' "${_out}" | grep -qE 'Domains not changed\.|Skipping\. Next renewal time is:'; then
+        local _cert_dir="${HOME}/.acme.sh/${_domain}_ecc"
+        if [ -f "${_cert_dir}/fullchain.cer" ] || [ -f "${_cert_dir}/${_domain}.cer" ]; then
+            log_info "证书已存在且未到续期时间，复用现有证书"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 acme_issue_cf_token() {
     local _domain="$1" _token="$2" _zone="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
@@ -1650,9 +1662,14 @@ export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "DNS-01 签发证书（Cloudflare Token）..."
-    CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
-        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
-        || { log_error "DNS-01 签发失败"; return 1; }
+    local _issue_out _issue_rc
+    _issue_out=$(CF_Token="${_token}" CF_Zone_ID="${_zone}" CF_Account_ID="" CF_Key="" CF_Email="" \
+        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+    _issue_rc=$?
+    printf '%s\n' "${_issue_out}"
+    if [ "${_issue_rc}" -ne 0 ]; then
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "DNS-01 签发失败"; return 1; }
+    fi
     acme_install_cert "${_domain}" "dns_cf_token"
 }
 
@@ -1660,6 +1677,7 @@ acme_issue_cf_key() {
     local _domain="$1" _cf_key="$2" _cf_email="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
     [ -n "${_cf_key:-}" ]   || { log_error "Cloudflare Global API Key 不能为空"; return 1; }
+    case "${_cf_key}" in cfut_*|cfat_*) log_error "你输入的是 Cloudflare API Token，不是 Global API Key；请选择选项 2"; return 1;; esac
     [ -n "${_cf_email:-}" ] || { log_error "Cloudflare 账号邮箱不能为空"; return 1; }
     [ -n "${_email:-}" ]    || { log_error "ACME 邮箱不能为空"; return 1; }
     case "${_cf_key}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare Global API Key 含非法字符"; return 1;; esac
@@ -1674,9 +1692,14 @@ export CF_Key CF_Email
 " || { log_error "ACME 凭证写入失败"; return 1; }
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "DNS-01 签发证书（Cloudflare Global Key）..."
-    CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
-        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
-        || { log_error "DNS-01 签发失败"; return 1; }
+    local _issue_out _issue_rc
+    _issue_out=$(CF_Token="" CF_Zone_ID="" CF_Account_ID="" CF_Key="${_cf_key}" CF_Email="${_cf_email}" \
+        "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" 2>&1)
+    _issue_rc=$?
+    printf '%s\n' "${_issue_out}"
+    if [ "${_issue_rc}" -ne 0 ]; then
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "DNS-01 签发失败"; return 1; }
+    fi
     acme_install_cert "${_domain}" "dns_cf_key"
 }
 
@@ -1709,20 +1732,14 @@ acme_issue_http01() {
     mkdir -p "${_CERT_DIR}/${_domain}"
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "HTTP-01 standalone 签发证书..."
-    "${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" \
-        || { log_error "HTTP-01 签发失败"; return 1; }
-    "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
-        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
-        --reloadcmd "systemctl restart ${_SVC_XRAY} >/dev/null 2>&1 || true" \
-        || { log_error "证书安装失败"; return 1; }
-    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
-    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
-    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
-    st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "http01"' \
-        --arg d "${_domain}" \
-        --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
-        --arg k "${_CERT_DIR}/${_domain}/privkey.pem"
+    local _issue_out _issue_rc
+    _issue_out=$("${HOME}/.acme.sh/acme.sh" --issue -d "${_domain}" --standalone --httpport 80 --keylength ec-256 --accountemail "${_email}" 2>&1)
+    _issue_rc=$?
+    printf '%s\n' "${_issue_out}"
+    if [ "${_issue_rc}" -ne 0 ]; then
+        acme_issue_ok_or_existing "${_domain}" "${_issue_out}" || { log_error "HTTP-01 签发失败"; return 1; }
+    fi
+    acme_install_cert "${_domain}" "http01"
 }
 
 vlquic_config_cert() {
