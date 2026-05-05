@@ -20,7 +20,6 @@ readonly STATE_FILE="${WORK_DIR}/state.json"
 readonly PLUGIN_DIR="${WORK_DIR}/plugins"
 readonly SHORTCUT="/usr/local/bin/s"
 readonly SELF_DEST="/usr/local/bin/xray2go"
-readonly UPSTREAM_URL="https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh"
 
 readonly _LOCK_FILE="${WORK_DIR}/.lock"
 readonly _FW_PORTS_FILE="${WORK_DIR}/.fw_ports"
@@ -448,11 +447,6 @@ val_listen_addr() {
     log_error "非法监听地址: ${_a}"
     return 1
 }
-
-# 简单事务：配置变更失败时恢复内存 state，避免坏状态后续被持久化
-state_checkpoint() { _G_STATE_SNAPSHOT="${_G_STATE}"; }
-state_rollback()  { [ -n "${_G_STATE_SNAPSHOT:-}" ] && _G_STATE="${_G_STATE_SNAPSHOT}"; _G_STATE_SNAPSHOT=""; }
-state_commit()    { _G_STATE_SNAPSHOT=""; }
 
 _st_persist_inner() {
     local _json
@@ -1501,15 +1495,6 @@ _module_disable_commit() {
 #     token 仅存入 0600 env 文件；ingress 由 Cloudflare Zero Trust 远端配置管理。
 #   - credentials/local-managed tunnel：官方命令 cloudflared tunnel --config tunnel.yml run
 #     tunnel.yml 包含 tunnel ID、credentials-file 与本地 ingress。
-
-argo_build_tunnel_cmd() {
-    local _token; _token=$(st_get '.argo.token')
-    if [ -n "${_token:-}" ] && [ "${_token}" != "null" ] && [ ! -f "${WORK_DIR}/tunnel.json" ]; then
-        printf '%s tunnel --no-autoupdate run --token <redacted>' "${ARGO_BIN}"
-    else
-        printf '%s tunnel --no-autoupdate --config %s run' "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
-    fi
-}
 
 # 生成 tunnel.yml（cred 模式：含 credentials-file）
 _argo_gen_yml_cred() {
