@@ -1644,9 +1644,11 @@ acme_issue_cf() {
     mkdir -p "${_CERT_DIR}/${_domain}"
     atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
 CF_Zone_ID='${_zone}'
+export CF_Token CF_Zone_ID
 " || { log_error "ACME 凭证写入失败"; return 1; }
     # shellcheck disable=SC1090
     . "${_ACME_ENV_FILE}"
+    export CF_Token CF_Zone_ID
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     log_step "DNS-01 签发证书（Cloudflare）..."
     "${HOME}/.acme.sh/acme.sh" --issue --dns dns_cf -d "${_domain}" --keylength ec-256 --accountemail "${_email}" \
