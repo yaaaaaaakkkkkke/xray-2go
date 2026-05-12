@@ -108,7 +108,7 @@ urlencode_path() {
         's/%/%25/g;s/ /%20/g;s/!/%21/g;s/"/%22/g;s/#/%23/g;s/\$/%24/g;
          s/&/%26/g;s/'\''/%27/g;s/(/%28/g;s/)/%29/g;s/\*/%2A/g;s/+/%2B/g;
          s/,/%2C/g;s/:/%3A/g;s/;/%3B/g;s/=/%3D/g;s/?/%3F/g;s/@/%40/g;
-         s/\[/%5B/g;s/\]/%5D/g'
+         s/\[/%5B/g;s/\]/%5D/g;s|/|%2F|g'
 }
 
 # ==============================================================================
@@ -277,7 +277,8 @@ readonly _STATE_DEFAULT='{
     "ff":      8080,
     "reality": 443,
     "vltcp":   1234,
-    "vlquic":  443
+    "vlquic":  443,
+    "cforigin": 28888
   },
   "argo": {
     "enabled":  true,
@@ -308,6 +309,18 @@ readonly _STATE_DEFAULT='{
     "enabled": false,
     "listen":  "0.0.0.0",
     "domain":  "",
+    "cert":    "",
+    "key":     "",
+    "acme_method": "manual"
+  },
+  "cforigin": {
+    "enabled": false,
+    "domain":  "",
+    "protocol": "ws",
+    "path":    "/origin",
+    "listen":  "::",
+    "edge_port": 443,
+    "origin_tls": true,
     "cert":    "",
     "key":     "",
     "acme_method": "manual"
@@ -421,7 +434,7 @@ xpad_of() {
 # 统一端口读取接口（单一数据源）
 # 所有模块禁止硬编码端口，必须调用此函数
 port_of() {
-    # 用法：port_of argo / ff / reality / vltcp / vlquic
+    # 用法：port_of argo / ff / reality / vltcp / vlquic / cforigin
     local _v; _v=$(st_get ".ports.${1}")
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
@@ -475,6 +488,34 @@ val_listen_addr() {
     fi
     log_error "非法监听地址: ${_a}"
     return 1
+}
+
+cf_edge_port_valid() {
+    case "${1:-}" in
+        80|8080|8880|2052|2082|2086|2095|443|2053|2083|2087|2096|8443) return 0 ;;
+        *) log_error "Cloudflare 入口端口不在普通橙云支持列表: ${1:-}"; return 1 ;;
+    esac
+}
+
+cforigin_print_cloudflare_hint() {
+    [ "$(st_get '.cforigin.enabled')" = "true" ] || return 0
+    local _domain _edge _origin _path _tls
+    _domain=$(st_get '.cforigin.domain')
+    _edge=$(st_get '.cforigin.edge_port')
+    _origin=$(port_of cforigin)
+    _path=$(st_get '.cforigin.path')
+    _tls=$(st_get '.cforigin.origin_tls')
+    echo ""
+    log_title "Cloudflare Origin 回源配置提示"
+    printf "  DNS: %s -> VPS IP，Proxy status: Proxied / 橙云\n" "${_domain:-<你的域名>}"
+    printf "  Origin Rule: Hostname equals %s -> Destination Port Override: %s\n" "${_domain:-<你的域名>}" "${_origin}"
+    printf "  客户端入口端口: %s；Xray 源站回源端口: %s；path: %s\n" "${_edge}" "${_origin}" "${_path}"
+    if [ "${_tls}" = "true" ]; then
+        printf "  SSL/TLS: 建议 Full 或 Full strict；源站 Xray 已按 TLS 回源生成配置。\n"
+    else
+        printf "  SSL/TLS: 当前为明文 HTTP 回源，需要 Flexible 或等效配置，不推荐。\n"
+    fi
+    printf "  注意: 节点链接端口写 %s，不要写源站回源端口 %s。\n" "${_edge}" "${_origin}"
 }
 
 _st_persist_inner() {
@@ -535,6 +576,8 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vltcp = 1234'
     _c=$(st_get '.ports.vlquic')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vlquic = 443'
+    _c=$(st_get '.ports.cforigin')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.cforigin = 28888'
 
     _c=$(st_get '.reality.network')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
@@ -577,6 +620,26 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.path = "/"'
     _c=$(st_get '.ff.protocol')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.ff.protocol = "none"'
+    _c=$(st_get '.cforigin.enabled')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.enabled = false'
+    _c=$(st_get '.cforigin.domain')
+    { [ "${_c}" = "null" ]; } && st_set '.cforigin.domain = ""'
+    _c=$(st_get '.cforigin.protocol')
+    case "${_c:-}" in ws|httpupgrade|xhttp) : ;; *) st_set '.cforigin.protocol = "ws"' ;; esac
+    _c=$(st_get '.cforigin.path')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.path = "/origin"'
+    _c=$(st_get '.cforigin.listen')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.listen = "::"'
+    _c=$(st_get '.cforigin.edge_port')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.cforigin.edge_port = 443'
+    _c=$(st_get '.cforigin.origin_tls')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.origin_tls = true'
+    _c=$(st_get '.cforigin.cert')
+    { [ "${_c}" = "null" ]; } && st_set '.cforigin.cert = ""'
+    _c=$(st_get '.cforigin.key')
+    { [ "${_c}" = "null" ]; } && st_set '.cforigin.key = ""'
+    _c=$(st_get '.cforigin.acme_method')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.cforigin.acme_method = "manual"'
 
     return 0
 }
@@ -657,6 +720,7 @@ plugin_install_builtins() {
     _plugin_write_reality
     _plugin_write_vltcp
     _plugin_write_vlquic
+    _plugin_write_cforigin
 }
 
 # ==============================================================================
@@ -963,6 +1027,90 @@ PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/vltcp.sh"
 }
 
+_plugin_write_cforigin() {
+cat > "${PLUGIN_DIR}/cforigin.sh" << 'PLUGIN_EOF'
+# xray-2go plugin: cforigin (Cloudflare Origin Rule / Destination Port)
+
+_cf_origin_tls_json() {
+    local _domain _cert _key
+    _domain=$(st_get '.cforigin.domain')
+    _cert=$(st_get '.cforigin.cert')
+    _key=$(st_get '.cforigin.key')
+    [ "$(st_get '.cforigin.origin_tls')" = "true" ] || { printf '{}'; return 0; }
+    [ -n "${_domain:-}" ] && [ -n "${_cert:-}" ] && [ -n "${_key:-}" ] || {
+        log_error "CF Origin 已启用 TLS 回源但缺少域名或证书路径"; return 1; }
+    jq -n --arg domain "${_domain}" --arg cert "${_cert}" --arg key "${_key}" '{
+        security:"tls",
+        tlsSettings:{serverName:$domain, certificates:[{certificateFile:$cert, keyFile:$key}]}
+    }'
+}
+
+_plg_cforigin_enabled() {
+    [ "$(st_get '.cforigin.enabled')" = "true" ]
+}
+
+_plg_cforigin_ports() {
+    _plg_cforigin_enabled || return 0
+    port_of cforigin
+}
+
+_plg_cforigin_inbound() {
+    _plg_cforigin_enabled || return 0
+    local _port _listen _uuid _proto _path _tls
+    _port=$(port_of cforigin)
+    _listen=$(st_get '.cforigin.listen')
+    _uuid=$(st_get '.uuid')
+    _proto=$(st_get '.cforigin.protocol')
+    _path=$(st_get '.cforigin.path')
+    _tls=$(_cf_origin_tls_json) || return 1
+    case "${_proto}" in
+        ws)
+            jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
+                  --arg path "${_path}" --argjson tls "${_tls}" '{
+                port:$port, listen:$listen, protocol:"vless",
+                settings:{clients:[{id:$uuid}], decryption:"none"},
+                streamSettings:({network:"ws", wsSettings:{path:$path}} + $tls)}' ;;
+        httpupgrade)
+            jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
+                  --arg path "${_path}" --argjson tls "${_tls}" '{
+                port:$port, listen:$listen, protocol:"vless",
+                settings:{clients:[{id:$uuid}], decryption:"none"},
+                streamSettings:({network:"httpupgrade", httpupgradeSettings:{path:$path}} + $tls)}' ;;
+        xhttp)
+            jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg uuid "${_uuid}" \
+                  --arg path "${_path}" --argjson tls "${_tls}" '{
+                port:$port, listen:$listen, protocol:"vless",
+                settings:{clients:[{id:$uuid}], decryption:"none"},
+                streamSettings:({network:"xhttp", xhttpSettings:{path:$path, mode:"stream-one"}} + $tls)}' ;;
+        *) log_error "_plg_cforigin_inbound: 未知协议 ${_proto}"; return 1 ;;
+    esac
+}
+
+_plg_cforigin_link() {
+    _plg_cforigin_enabled || return 0
+    local _domain _proto _uuid _edge_port _path _penc
+    _domain=$(st_get '.cforigin.domain')
+    [ -n "${_domain:-}" ] && [ "${_domain}" != "null" ] || return 0
+    _proto=$(st_get '.cforigin.protocol')
+    _uuid=$(st_get '.uuid')
+    _edge_port=$(st_get '.cforigin.edge_port')
+    _penc=$(urlencode_path "$(st_get '.cforigin.path')")
+    case "${_proto}" in
+        ws)
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#CF-Origin-WS\n' \
+                "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" ;;
+        httpupgrade)
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=httpupgrade&host=%s&path=%s#CF-Origin-HTTPUpgrade\n' \
+                "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" ;;
+        xhttp)
+            printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=xhttp&host=%s&path=%s&mode=stream-one#CF-Origin-XHTTP\n' \
+                "${_uuid}" "${_domain}" "${_edge_port}" "${_domain}" "${_domain}" "${_penc}" ;;
+    esac
+}
+PLUGIN_EOF
+    chmod 644 "${PLUGIN_DIR}/cforigin.sh"
+}
+
 _plugin_write_vlquic() {
 cat > "${PLUGIN_DIR}/vlquic.sh" << 'PLUGIN_EOF'
 # xray-2go plugin: vlquic (VLESS + XHTTP stream-one H3)
@@ -1204,6 +1352,10 @@ $(port_of vltcp)"
     if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
         _ports="${_ports}
 $(port_of vlquic)"
+    fi
+    if [ "$(st_get '.cforigin.enabled')" = "true" ]; then
+        _ports="${_ports}
+$(port_of cforigin)"
     fi
     local _uniq _rule _rp _rb _rproto
     _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
@@ -1762,19 +1914,19 @@ export CF_Token CF_Zone_ID
         || { log_error "DNS-01 签发失败；请检查 Cloudflare Token 权限（Zone:Read + DNS:Edit）、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_token"
 }
-
 acme_issue_cf_key() {
     local _domain="$1" _cf_key="$2" _cf_email="$3" _email="${4:-}"
     val_domain "${_domain}" >/dev/null || return 1
     [ -n "${_cf_key:-}" ]   || { log_error "Cloudflare Global API Key 不能为空"; return 1; }
     case "${_cf_key}" in cfut_*|cfat_*) log_error "你输入的是 Cloudflare API Token，不是 Global API Key；请选择选项 2"; return 1;; esac
     [ -n "${_cf_email:-}" ] || { log_error "Cloudflare 账号邮箱不能为空"; return 1; }
-    [ -n "${_email:-}" ]    || { log_error "ACME 邮箱不能为空"; return 1; }
+
     case "${_cf_key}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare Global API Key 含非法字符"; return 1;; esac
     case "${_cf_email}" in *' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "Cloudflare 账号邮箱不合法"; return 1;; esac
     printf '%s' "${_cf_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
         || { log_error "Cloudflare 账号邮箱格式不合法"; return 1; }
-    acme_install "${_email}" || return 1
+
+    acme_install "${_email:-${_cf_email}}" || return 1
     mkdir -p "${_CERT_DIR}/${_domain}"
     atomic_write_secret "${_ACME_ENV_FILE}" "CF_Key='${_cf_key}'
 CF_Email='${_cf_email}'
@@ -1784,6 +1936,46 @@ export CF_Key CF_Email
     acme_issue_with_ca_fallback "${_domain}" "${_email}" key "${_cf_key}" "${_cf_email}" dns_cf \
         || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "dns_cf_key"
+}
+
+acme_issue_cf_token_to_state() {
+    local _prefix="$1" _domain="$2" _token="$3" _email="${4:-}" _zone
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_token:-}" ] || { log_error "Cloudflare API Token 不能为空"; return 1; }
+    case "${_token}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare API Token 含非法字符"; return 1;; esac
+    _zone=$(acme_cf_find_zone "${_domain}" "${_token}") || return 1
+    acme_install "${_email}" || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    atomic_write_secret "${_ACME_ENV_FILE}" "CF_Token='${_token}'
+CF_Zone_ID='${_zone}'
+export CF_Token CF_Zone_ID
+" || { log_error "ACME 凭证写入失败"; return 1; }
+    log_step "DNS-01 签发证书（Cloudflare Token；按 Let's Encrypt → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" token "${_token}" "${_zone}" dns_cf \
+        || { log_error "DNS-01 签发失败；请检查 Cloudflare Token 权限（Zone:Read + DNS:Edit）、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
+    acme_install_cert_to_state "${_prefix}" "${_domain}" "dns_cf_token"
+}
+
+acme_issue_cf_key_to_state() {
+    local _prefix="$1" _domain="$2" _cf_key="$3" _cf_email="$4" _email="${5:-}"
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_cf_key:-}" ]   || { log_error "Cloudflare Global API Key 不能为空"; return 1; }
+    case "${_cf_key}" in cfut_*|cfat_*) log_error "你输入的是 Cloudflare API Token，不是 Global API Key；请选择 Token 模式"; return 1;; esac
+    [ -n "${_cf_email:-}" ] || { log_error "Cloudflare 账号邮箱不能为空"; return 1; }
+    case "${_cf_key}" in *$'\r'*|*$'\n'*|*"'"*) log_error "Cloudflare Global API Key 含非法字符"; return 1;; esac
+    case "${_cf_email}" in *' '*|*"'"*|*'"'*|*'`'*|*'\'*) log_error "Cloudflare 账号邮箱不合法"; return 1;; esac
+    printf '%s' "${_cf_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
+        || { log_error "Cloudflare 账号邮箱格式不合法"; return 1; }
+    acme_install "${_email:-${_cf_email}}" || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    atomic_write_secret "${_ACME_ENV_FILE}" "CF_Key='${_cf_key}'
+CF_Email='${_cf_email}'
+export CF_Key CF_Email
+" || { log_error "ACME 凭证写入失败"; return 1; }
+    log_step "DNS-01 签发证书（Cloudflare Global Key；按 Let's Encrypt → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" key "${_cf_key}" "${_cf_email}" dns_cf \
+        || { log_error "DNS-01 签发失败；请检查 Cloudflare Global API Key/账号邮箱、域名是否在该账号下，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
+    acme_install_cert_to_state "${_prefix}" "${_domain}" "dns_cf_key"
 }
 
 acme_install_cert() {
@@ -1805,6 +1997,26 @@ acme_install_cert() {
         --arg m "${_method}"
 }
 
+acme_install_cert_to_state() {
+    local _prefix="$1" _domain="$2" _method="${3:-manual}"
+    "${HOME}/.acme.sh/acme.sh" --install-cert -d "${_domain}" --ecc \
+        --fullchain-file "${_CERT_DIR}/${_domain}/fullchain.pem" \
+        --key-file "${_CERT_DIR}/${_domain}/privkey.pem" \
+        || { log_error "证书安装失败"; return 1; }
+    chmod 700 "${_CERT_DIR}/${_domain}" 2>/dev/null || true
+    chmod 600 "${_CERT_DIR}/${_domain}/privkey.pem" 2>/dev/null || true
+    chmod 644 "${_CERT_DIR}/${_domain}/fullchain.pem" 2>/dev/null || true
+    case "${_prefix}" in
+        cforigin)
+            st_set '.cforigin.domain = $d | .cforigin.cert = $c | .cforigin.key = $k | .cforigin.acme_method = $m' \
+                --arg d "${_domain}" \
+                --arg c "${_CERT_DIR}/${_domain}/fullchain.pem" \
+                --arg k "${_CERT_DIR}/${_domain}/privkey.pem" \
+                --arg m "${_method}" ;;
+        *) log_error "未知证书状态前缀: ${_prefix}"; return 1 ;;
+    esac
+}
+
 acme_issue_http01() {
     local _domain="$1" _email="${2:-}"
     val_domain "${_domain}" >/dev/null || return 1
@@ -1819,6 +2031,83 @@ acme_issue_http01() {
     acme_issue_with_ca_fallback "${_domain}" "${_email}" none "" "" http01 \
         || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
     acme_install_cert "${_domain}" "http01"
+}
+
+acme_issue_http01_to_state() {
+    local _prefix="$1" _domain="$2" _email="${3:-}"
+    val_domain "${_domain}" >/dev/null || return 1
+    [ -n "${_email:-}" ] || { log_error "ACME 邮箱不能为空"; return 1; }
+    if port_mgr_in_use 80; then
+        log_error "80/tcp 已被占用，无法使用 HTTP-01 standalone"
+        return 1
+    fi
+    acme_install "${_email}" || return 1
+    mkdir -p "${_CERT_DIR}/${_domain}"
+    log_step "HTTP-01 standalone 签发证书（按 Let's Encrypt → ZeroSSL 轮换）..."
+    acme_issue_with_ca_fallback "${_domain}" "${_email}" none "" "" http01 \
+        || { log_error "HTTP-01 签发失败；请检查 A 记录、80/tcp 端口、DNS only，以及 VPS 到 CA 的 443 出站连通性"; return 1; }
+    acme_install_cert_to_state "${_prefix}" "${_domain}" "http01"
+}
+
+cforigin_config_cert() {
+    echo ""; log_title "CF Origin 源站 TLS 证书配置"
+    local _domain _email; prompt "回源域名（需已接入 Cloudflare 并开启橙云）: " _domain
+    _domain=$(val_domain "${_domain}") || return 1
+    st_set '.cforigin.domain = $d' --arg d "${_domain}" || return 1
+    echo ""
+    printf "  ${C_GRN}1.${C_RST} Cloudflare API Token ${C_YLW}[推荐：Zone:Read + DNS:Edit]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} Cloudflare Global API Key\n"
+    printf "  ${C_GRN}3.${C_RST} HTTP-01 standalone ${C_YLW}[需要80端口]${C_RST}\n"
+    printf "  ${C_GRN}4.${C_RST} 使用已有证书文件\n"
+    printf "  ${C_GRN}5.${C_RST} 保留/使用已配置证书路径 ${C_YLW}[手动已配 CF 回源时常用]${C_RST}\n"
+    printf "  ${C_GRN}6.${C_RST} 明文 HTTP 回源 ${C_RED}[不推荐]${C_RST}\n"
+    local _m; prompt "请选择 (1-6，回车默认1): " _m
+    if [ "${_m:-1}" != "4" ] && [ "${_m:-1}" != "5" ] && [ "${_m:-1}" != "6" ]; then
+        prompt "ACME 邮箱（用于 Let's Encrypt 账户，不能使用 example.com）: " _email
+        case "${_email:-}" in
+            *@example.com|*@example.org|*@example.net|''|*' '*|*"'"*|*'"'*|*'`'*|*'\\'*) log_error "ACME 邮箱不合法"; return 1 ;;
+        esac
+        printf '%s' "${_email}" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' \
+            || { log_error "ACME 邮箱格式不合法"; return 1; }
+    fi
+    case "${_m:-1}" in
+        1)
+            local _token
+            prompt "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
+            acme_issue_cf_token_to_state cforigin "${_domain}" "${_token}" "${_email}" || return 1
+            st_set '.cforigin.origin_tls = true' ;;
+        2)
+            local _cf_key _cf_email
+            prompt "Cloudflare 账号邮箱: " _cf_email
+            prompt "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
+            acme_issue_cf_key_to_state cforigin "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1
+            st_set '.cforigin.origin_tls = true' ;;
+        3)
+            log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
+            acme_issue_http01_to_state cforigin "${_domain}" "${_email}" || return 1
+            st_set '.cforigin.origin_tls = true' ;;
+        4)
+            local _cert _key
+            prompt "fullchain.pem 路径: " _cert
+            prompt "privkey.pem 路径: " _key
+            [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
+            [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
+            st_set '.cforigin.origin_tls = true | .cforigin.cert = $c | .cforigin.key = $k | .cforigin.acme_method = "manual"' \
+                --arg c "${_cert}" --arg k "${_key}" ;;
+        5)
+            local _cert _key
+            _cert=$(st_get '.cforigin.cert'); _key=$(st_get '.cforigin.key')
+            if [ -z "${_cert:-}" ] || [ -z "${_key:-}" ] || [ ! -f "${_cert}" ] || [ ! -f "${_key}" ]; then
+                log_error "当前没有可用的已配置证书路径；请选择 1-4 配置证书，或 6 明文回源"
+                return 1
+            fi
+            st_set '.cforigin.origin_tls = true | .cforigin.acme_method = "manual_existing"' ;;
+        6)
+            log_warn "已选择明文 HTTP 回源：需要 Cloudflare Flexible 或等效配置，不推荐。"
+            st_set '.cforigin.origin_tls = false | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "plain_http"' ;;
+        *) log_error "无效选项"; return 1 ;;
+    esac
+    log_ok "CF Origin 回源证书/域名配置完成: ${_domain}"
 }
 
 vlquic_config_cert() {
@@ -2486,6 +2775,54 @@ ask_vltcp_mode() {
 }
 
 
+ask_cforigin_mode() {
+    echo ""; log_title "Cloudflare Origin 端口回源"
+    printf "  ${C_GRN}1.${C_RST} 启用 CF Origin 回源\n"
+    printf "  ${C_GRN}2.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
+    local _c; prompt "请选择 (1-2，回车默认2): " _c
+    case "${_c:-2}" in
+        1) st_set '.cforigin.enabled = true';;
+        *) st_set '.cforigin.enabled = false'; log_info "不启用 CF Origin 回源"; echo ""; return 0;;
+    esac
+
+    echo ""
+    printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认，兼容性最好]${C_RST}\n"
+    printf "  ${C_GRN}2.${C_RST} HTTPUpgrade\n"
+    printf "  ${C_GRN}3.${C_RST} XHTTP (stream-one)\n"
+    local _pc; prompt "传输协议 (1-3，回车默认1): " _pc
+    case "${_pc:-1}" in
+        2) st_set '.cforigin.protocol = "httpupgrade"';;
+        3) st_set '.cforigin.protocol = "xhttp"';;
+        *) st_set '.cforigin.protocol = "ws"';;
+    esac
+
+    local _p _vp; prompt "path（回车默认 /origin）: " _p
+    _vp=$(val_path "${_p:-/origin}") || { st_set '.cforigin.enabled = false'; return 1; }
+    st_set '.cforigin.path = $p' --arg p "${_vp}" || return 1
+
+    local _edge; prompt "客户端入口端口（Cloudflare Edge，回车默认 443）: " _edge
+    _edge="${_edge:-443}"
+    val_port "${_edge}" >/dev/null || { st_set '.cforigin.enabled = false'; return 1; }
+    cf_edge_port_valid "${_edge}" || { st_set '.cforigin.enabled = false'; return 1; }
+    st_set '.cforigin.edge_port = ($p|tonumber)' --arg p "${_edge}" || return 1
+
+    local _origin _cur_origin; _cur_origin=$(port_of cforigin)
+    prompt "源站回源端口（Xray Origin，需与已手动配置的 Origin Rule 一致，回车默认 ${_cur_origin:-28888}）: " _origin
+    _origin="${_origin:-${_cur_origin:-28888}}"
+    val_port "${_origin}" >/dev/null || { st_set '.cforigin.enabled = false'; return 1; }
+    st_set '.ports.cforigin = ($p|tonumber)' --arg p "${_origin}" || return 1
+    port_mgr_in_use "$(port_of cforigin)" && log_warn "端口 $(port_of cforigin) 已被占用"
+    log_info "如果你已在 Cloudflare 手动配置 Origin Rule，请确认 Destination Port Override = $(port_of cforigin)"
+
+    local _dl; _dl=$(st_get '.cforigin.listen')
+    local _vl; prompt "监听地址（回车默认 ${_dl}，::=IPv4+IPv6）: " _vl
+    [ -n "${_vl:-}" ] && { _vl=$(val_listen_addr "${_vl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; _vl="${_dl}"; }; st_set '.cforigin.listen = $l' --arg l "${_vl}"; }
+
+    cforigin_config_cert || { st_set '.cforigin.enabled = false'; return 1; }
+    log_info "CF Origin 配置完成 — 协议:$(st_get '.cforigin.protocol') Edge:$(st_get '.cforigin.edge_port') Origin:$(port_of cforigin) Path:$(st_get '.cforigin.path')"
+    echo ""
+}
+
 ask_vlquic_mode() {
     echo ""; log_title "VLESS-XHTTP-H3（UDP/QUIC）"
     printf "  ${C_GRN}1.${C_RST} 启用 VLESS-XHTTP-H3\n"
@@ -3060,6 +3397,126 @@ manage_vlquic() {
     done
 }
 
+
+# ── Cloudflare Origin 回源管理 ────────────────────────────────────────────────
+
+manage_cforigin() {
+    [ -f "${CONFIG_FILE}" ] || { log_warn "请先完成 Xray-2go 安装"; sleep 1; return; }
+    while true; do
+        local _en _proto _path _domain _edge _origin _listen _tls _method _xstat
+        _en=$(st_get '.cforigin.enabled')
+        _proto=$(st_get '.cforigin.protocol')
+        _path=$(st_get '.cforigin.path')
+        _domain=$(st_get '.cforigin.domain')
+        _edge=$(st_get '.cforigin.edge_port')
+        _origin=$(port_of cforigin)
+        _listen=$(st_get '.cforigin.listen')
+        _tls=$(st_get '.cforigin.origin_tls')
+        _method=$(st_get '.cforigin.acme_method')
+        svc_exec status "${_SVC_XRAY}" >/dev/null 2>&1 && _xstat="running" || _xstat="stopped"
+
+        clear; echo ""; log_title "══ Cloudflare Origin 回源管理 ══"
+        [ "${_en}" = "true" ] \
+            && printf "  模块: ${C_GRN}已启用${C_RST}  服务: ${C_GRN}%s${C_RST}\n" "${_xstat}" \
+            || printf "  模块: ${C_YLW}未启用${C_RST}\n"
+        printf "  协议: ${C_CYN}%s${C_RST}  path: ${C_YLW}%s${C_RST}\n" "${_proto}" "${_path}"
+        printf "  域名: ${C_CYN}%s${C_RST}  Edge端口: ${C_GRN}%s${C_RST}  Origin端口: ${C_YLW}%s${C_RST}\n" "${_domain:-未配置}" "${_edge}" "${_origin}"
+        printf "  监听: ${C_CYN}%s${C_RST}  回源TLS: ${C_YLW}%s${C_RST}  证书: ${C_YLW}%s${C_RST}\n" "${_listen}" "${_tls}" "${_method:-manual}"
+        _hr
+        printf "  ${C_GRN}1.${C_RST} 启用 CF Origin\n"
+        printf "  ${C_RED}2.${C_RST} 禁用 CF Origin\n"
+        printf "  ${C_GRN}3.${C_RST} 重启 xray2go 服务\n"
+        printf "  ${C_RED}9.${C_RST} 卸载 CF Origin\n"
+        _hr
+        printf "  ${C_GRN}4.${C_RST} 修改协议 (WS / HTTPUpgrade / XHTTP)\n"
+        printf "  ${C_GRN}5.${C_RST} 修改域名/证书（支持已手动配置 CF 回源）\n"
+        printf "  ${C_GRN}6.${C_RST} 修改 path（当前: ${C_YLW}${_path}${C_RST}）\n"
+        printf "  ${C_GRN}7.${C_RST} 修改 Edge 入口端口（当前: ${C_GRN}${_edge}${C_RST}）\n"
+        printf "  ${C_GRN}8.${C_RST} 修改 Origin 回源端口（当前: ${C_YLW}${_origin}${C_RST}）\n"
+        printf "  ${C_GRN}a.${C_RST} 修改监听地址（当前: ${C_CYN}${_listen}${C_RST}）\n"
+        printf "  ${C_GRN}b.${C_RST} 查看节点/Cloudflare 提示\n"
+        printf "  ${C_PUR}0.${C_RST} 返回\n"; _hr
+        local _c; prompt "请输入选择: " _c
+        case "${_c:-}" in
+            1)
+                [ "${_en}" = "true" ] && { log_info "CF Origin 已启用"; _pause; continue; }
+                ask_cforigin_mode || { _pause; continue; }
+                [ "$(st_get '.cforigin.enabled')" = "true" ] || { _pause; continue; }
+                _commit || { _pause; continue; }
+                log_ok "CF Origin 已启用"; config_print_nodes; cforigin_print_cloudflare_hint ;;
+            2)
+                [ "${_en}" != "true" ] && { log_info "CF Origin 已禁用"; _pause; continue; }
+                st_set '.cforigin.enabled = false' || { _pause; continue; }
+                _module_disable_commit "CF Origin" || { _pause; continue; }
+                log_ok "CF Origin 已禁用" ;;
+            3) svc_restart_xray || true ;;
+            9)
+                _menu_confirm_uninstall "CF Origin" || { _pause; continue; }
+                st_set '.cforigin.enabled = false | .cforigin.domain = "" | .cforigin.protocol = "ws" | .cforigin.path = "/origin" | .cforigin.listen = "::" | .cforigin.edge_port = 443 | .cforigin.origin_tls = true | .cforigin.cert = "" | .cforigin.key = "" | .cforigin.acme_method = "manual" | .ports.cforigin = 28888' || { _pause; continue; }
+                _module_disable_commit "CF Origin" || { _pause; continue; }
+                log_ok "CF Origin 已卸载"; _pause; return ;;
+            4)
+                echo ""; printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认]${C_RST}\n"; printf "  ${C_GRN}2.${C_RST} HTTPUpgrade\n"; printf "  ${C_GRN}3.${C_RST} XHTTP (stream-one)\n"
+                local _pc; prompt "传输协议 (1-3，回车保持 ${_proto}): " _pc
+                case "${_pc:-}" in 1) st_set '.cforigin.protocol = "ws"';; 2) st_set '.cforigin.protocol = "httpupgrade"';; 3) st_set '.cforigin.protocol = "xhttp"';; '') :;; *) log_error "无效选项"; _pause; continue;; esac
+                [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                st_persist || log_warn "state.json 写入失败"
+                log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"; [ "${_en}" = "true" ] && config_print_nodes ;;
+            5)
+                cforigin_config_cert || { _pause; continue; }
+                [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                st_persist || log_warn "state.json 写入失败"
+                log_ok "CF Origin 域名/证书已更新"; [ "${_en}" = "true" ] && { config_print_nodes; cforigin_print_cloudflare_hint; } ;;
+            6)
+                local _p _vp; prompt "新 path（回车保持 ${_path}）: " _p
+                if [ -n "${_p:-}" ]; then
+                    _vp=$(val_path "${_p}") || { _pause; continue; }
+                    st_set '.cforigin.path = $p' --arg p "${_vp}" || { _pause; continue; }
+                    [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                    st_persist || log_warn "state.json 写入失败"
+                    log_ok "path 已更新: ${_vp}"; [ "${_en}" = "true" ] && config_print_nodes
+                fi ;;
+            7)
+                local _ep; prompt "新 Edge 入口端口（Cloudflare 支持端口，回车保持 ${_edge}）: " _ep
+                if [ -n "${_ep:-}" ]; then
+                    val_port "${_ep}" >/dev/null && cf_edge_port_valid "${_ep}" || { _pause; continue; }
+                    st_set '.cforigin.edge_port = ($p|tonumber)' --arg p "${_ep}" || { _pause; continue; }
+                    st_persist || log_warn "state.json 写入失败"
+                    log_ok "Edge 入口端口已更新: ${_ep}"; config_print_nodes; cforigin_print_cloudflare_hint
+                fi ;;
+            8)
+                local _np; prompt "新 Origin 回源端口（需与 Cloudflare Origin Rule 的 Destination Port 一致，回车随机）: " _np
+                if [ -z "${_np:-}" ]; then
+                    _menu_input_port '.ports.cforigin' _np || { _pause; continue; }
+                else
+                    val_port "${_np}" >/dev/null || { _pause; continue; }
+                    if port_mgr_in_use "${_np}"; then
+                        log_warn "端口 ${_np} 已被占用"
+                        local _a2; prompt "仍然继续？(y/N): " _a2
+                        case "${_a2:-n}" in y|Y) :;; *) _pause; continue;; esac
+                    fi
+                    st_set '.ports.cforigin = ($p|tonumber)' --arg p "${_np}" || { _pause; continue; }
+                fi
+                _commit_port_change cforigin "${_np}" || { _pause; continue; }
+                log_warn "如果 Cloudflare Origin Rule 已手动配置，请同步确认 Destination Port Override = ${_np}"
+                cforigin_print_cloudflare_hint ;;
+            a)
+                local _l; prompt "新监听地址（:: / 0.0.0.0 / 127.0.0.1）: " _l
+                if [ -n "${_l:-}" ]; then
+                    _l=$(val_listen_addr "${_l}") || { _pause; continue; }
+                    st_set '.cforigin.listen = $l' --arg l "${_l}" || { _pause; continue; }
+                    [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
+                    st_persist || log_warn "state.json 写入失败"
+                    log_ok "监听地址已更新: ${_l}"
+                fi ;;
+            b) config_print_nodes; cforigin_print_cloudflare_hint ;;
+            0) return ;;
+            *) log_error "无效选项" ;;
+        esac
+        _pause
+    done
+}
+
 # ── 主菜单 ────────────────────────────────────────────────────────────────────
 
 _menu_collect_status() {
@@ -3099,6 +3556,10 @@ _menu_collect_status() {
     [ "$(st_get '.vlquic.enabled')" = "true" ] \
         && _MENU_QD="已启用 (udp=$(port_of vlquic), domain=$(st_get '.vlquic.domain'))" \
         || _MENU_QD="未启用"
+
+    [ "$(st_get '.cforigin.enabled')" = "true" ] \
+        && _MENU_CD="已启用 ($(st_get '.cforigin.protocol'), edge=$(st_get '.cforigin.edge_port'), origin=$(port_of cforigin), domain=$(st_get '.cforigin.domain'))" \
+        || _MENU_CD="未启用"
 }
 
 _menu_render() {
@@ -3111,6 +3572,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  Reality  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_RD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  VLESS-TCP: %-29s${C_PUR} ${C_RST}\n" "${_MENU_VD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  XHTTP-H3 : %-29s${C_PUR} ${C_RST}\n" "${_MENU_QD}"
+    printf "${C_BOLD}${C_PUR}  ║${C_RST}  CF-Origin: %-29s${C_PUR} ${C_RST}\n" "${_MENU_CD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 安装 Xray-2go\n"
@@ -3119,7 +3581,8 @@ _menu_render() {
     printf "  ${C_GRN}4.${C_RST} Reality 管理\n"
     printf "  ${C_GRN}5.${C_RST} VLESS-TCP 管理\n"
     printf "  ${C_GRN}6.${C_RST} VLESS-XHTTP-H3 管理\n"
-    printf "  ${C_GRN}7.${C_RST} FreeFlow 管理\n"; _hr
+    printf "  ${C_GRN}7.${C_RST} FreeFlow 管理\n"
+    printf "  ${C_GRN}a.${C_RST} CF Origin 回源管理\n"; _hr
     printf "  ${C_GRN}8.${C_RST} 查看节点\n"
     printf "  ${C_GRN}9.${C_RST} 修改 UUID\n"
     printf "  ${C_GRN}s.${C_RST} 快捷方式/脚本更新\n"; _hr
@@ -3137,6 +3600,7 @@ _menu_do_install() {
     ask_reality_mode
     ask_vltcp_mode
     ask_vlquic_mode
+    ask_cforigin_mode
 
     if [ "$(st_get '.argo.enabled')" = "true" ] && [ "$(st_get '.argo.protocol')" = "xhttp" ]; then
         ask_xpad_mode argo Argo
@@ -3167,15 +3631,16 @@ _menu_do_install() {
         { argo_apply_fixed_tunnel || \
           log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"; }
     config_print_nodes
+    cforigin_print_cloudflare_hint
 }
 
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD=""
+    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD=""
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请输入选择 (0-9/s): " _c; echo ""
+        local _c; prompt "请输入选择 (0-9/a/s): " _c; echo ""
         case "${_c:-}" in
             1) _menu_do_install ;;
             2) exec_uninstall ;;
@@ -3184,13 +3649,14 @@ menu() {
             5) manage_vltcp ;;
             6) manage_vlquic ;;
             7) manage_freeflow ;;
-            8) [ "${_MENU_CX}" -eq 0 ] && config_print_nodes \
+            a) manage_cforigin ;;
+            8) [ "${_MENU_CX}" -eq 0 ] && { config_print_nodes; cforigin_print_cloudflare_hint; } \
                     || log_warn "Xray-2go 未安装或未运行" ;;
             9) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
                     || log_warn "请先安装 Xray-2go" ;;
             s) exec_update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9 或 s" ;;
+            *) log_error "无效选项，请输入 0-9、a 或 s" ;;
         esac
         _pause
     done
