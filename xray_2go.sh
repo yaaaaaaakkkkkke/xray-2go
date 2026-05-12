@@ -2776,16 +2776,20 @@ ask_vltcp_mode() {
 
 
 ask_cforigin_mode() {
+    local _skip_enable="${1:-}"
     echo ""; log_title "Cloudflare Origin 端口回源"
-    printf "  ${C_GRN}1.${C_RST} 启用 CF Origin 回源\n"
-    printf "  ${C_GRN}2.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
-    local _c; prompt "请选择 (1-2，回车默认2): " _c
-    case "${_c:-2}" in
-        1) st_set '.cforigin.enabled = true';;
-        *) st_set '.cforigin.enabled = false'; log_info "不启用 CF Origin 回源"; echo ""; return 0;;
-    esac
-
-    echo ""
+    if [ "${_skip_enable}" != "enabled" ]; then
+        printf "  ${C_GRN}1.${C_RST} 启用 CF Origin 回源\n"
+        printf "  ${C_GRN}2.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}\n"
+        local _c; prompt "请选择 (1-2，回车默认2): " _c
+        case "${_c:-2}" in
+            1) st_set '.cforigin.enabled = true';;
+            *) st_set '.cforigin.enabled = false'; log_info "不启用 CF Origin 回源"; echo ""; return 0;;
+        esac
+        echo ""
+    else
+        st_set '.cforigin.enabled = true' || return 1
+    fi
     printf "  ${C_GRN}1.${C_RST} WS ${C_YLW}[默认，兼容性最好]${C_RST}\n"
     printf "  ${C_GRN}2.${C_RST} HTTPUpgrade\n"
     printf "  ${C_GRN}3.${C_RST} XHTTP (stream-one)\n"
@@ -3440,7 +3444,7 @@ manage_cforigin() {
         case "${_c:-}" in
             1)
                 [ "${_en}" = "true" ] && { log_info "CF Origin 已启用"; _pause; continue; }
-                ask_cforigin_mode || { _pause; continue; }
+                ask_cforigin_mode enabled || { _pause; continue; }
                 [ "$(st_get '.cforigin.enabled')" = "true" ] || { _pause; continue; }
                 _commit || { _pause; continue; }
                 log_ok "CF Origin 已启用"; config_print_nodes; cforigin_print_cloudflare_hint ;;
@@ -3582,9 +3586,9 @@ _menu_render() {
     printf "  ${C_GRN}5.${C_RST} VLESS-TCP 管理\n"
     printf "  ${C_GRN}6.${C_RST} VLESS-XHTTP-H3 管理\n"
     printf "  ${C_GRN}7.${C_RST} FreeFlow 管理\n"
-    printf "  ${C_GRN}a.${C_RST} CF Origin 回源管理\n"; _hr
-    printf "  ${C_GRN}8.${C_RST} 查看节点\n"
-    printf "  ${C_GRN}9.${C_RST} 修改 UUID\n"
+    printf "  ${C_GRN}8.${C_RST} CF Origin 回源管理\n"; _hr
+    printf "  ${C_GRN}9.${C_RST} 查看节点\n"
+    printf "  ${C_GRN}10.${C_RST} 修改 UUID\n"
     printf "  ${C_GRN}s.${C_RST} 快捷方式/脚本更新\n"; _hr
     printf "  ${C_RED}0.${C_RST} 退出\n\n"
 }
@@ -3640,7 +3644,7 @@ menu() {
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请输入选择 (0-9/a/s): " _c; echo ""
+        local _c; prompt "请输入选择 (0-10/s): " _c; echo ""
         case "${_c:-}" in
             1) _menu_do_install ;;
             2) exec_uninstall ;;
@@ -3649,14 +3653,14 @@ menu() {
             5) manage_vltcp ;;
             6) manage_vlquic ;;
             7) manage_freeflow ;;
-            a) manage_cforigin ;;
-            8) [ "${_MENU_CX}" -eq 0 ] && { config_print_nodes; cforigin_print_cloudflare_hint; } \
+            8) manage_cforigin ;;
+            9) [ "${_MENU_CX}" -eq 0 ] && { config_print_nodes; cforigin_print_cloudflare_hint; } \
                     || log_warn "Xray-2go 未安装或未运行" ;;
-            9) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
+            10) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
                     || log_warn "请先安装 Xray-2go" ;;
             s) exec_update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9、a 或 s" ;;
+            *) log_error "无效选项，请输入 0-10 或 s" ;;
         esac
         _pause
     done
