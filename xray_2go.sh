@@ -91,6 +91,21 @@ prompt() {
     printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
     read -r "$2" </dev/tty
 }
+
+prompt_secret() {
+    printf '%s%s%s' "${C_RED}" "$1" "${C_RST}" >&2
+    read -r -s "$2" </dev/tty
+    printf '\n' >&2
+}
+
+redact_sensitive() {
+    sed -E \
+        -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]"'"'"']+/\1<redacted>/Ig' \
+        -e 's/(CF_Token=)['"'"']?[^[:space:]'"'"']+['"'"']?/\1<redacted>/Ig' \
+        -e 's/(CF_Key=)['"'"']?[^[:space:]'"'"']+['"'"']?/\1<redacted>/Ig' \
+        -e 's/(TUNNEL_TOKEN=)[A-Za-z0-9_=.-]{20,}/\1<redacted>/Ig' \
+        -e 's/(token["'"'=:[:space:]]+)[A-Za-z0-9_=.-]{20,}/\1<redacted>/Ig'
+}
 _pause() {
     local _d
     printf '%s按回车键继续...%s' "${C_RED}" "${C_RST}" >&2
@@ -522,7 +537,7 @@ _st_persist_inner() {
     local _json
     _json=$(printf '%s\n' "${_G_STATE}" | jq . 2>/dev/null) \
         || { log_error "state 序列化失败"; return 1; }
-    atomic_write_secret_with_backup "${STATE_FILE}" "${_json}" 3 || return 1
+    atomic_write_secret_with_backup "${STATE_FILE}" "${_json}" 2 || return 1
     # state.json 含 token 等敏感数据，严格限制权限
     chmod 600 "${STATE_FILE}" 2>/dev/null || true
 }
@@ -1223,38 +1238,62 @@ _fw_nft_ensure_table() {
         2>/dev/null || return 1
 }
 
-_fw_open_port() {
-    local _port="$1" _proto="${2:-tcp}" _any=0
-    if _fw_has_nftables; then
-        _fw_nft_ensure_table 2>/dev/null || true
-        if ! nft list chain inet xray2go input 2>/dev/null \
-             | grep -q "${_proto} dport ${_port} accept"; then
-            nft add rule inet xray2go input "${_proto}" dport "${_port}" accept 2>/dev/null \
-                && { _fw_mark_rule nft "${_port}" "${_proto}"; _any=1; }
-        else
-            _fw_mark_rule nft "${_port}" "${_proto}"
-        fi
+_fw_select_backend() {
+    if _fw_has_nftables; then printf 'nft'; return 0; fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then printf 'ufw'; return 0; fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then printf 'firewalld'; return 0; fi
+    if command -v iptables >/dev/null 2>&1; then printf 'iptables'; return 0; fi
+    printf 'none'
+}
+
+_fw_rule_exists() {
+    local _backend="$1" _port="$2" _proto="${3:-tcp}"
+    case "${_backend}" in
+        nft)
+            _fw_nft_table_exists && nft list chain inet xray2go input 2>/dev/null \
+                | grep -q "${_proto} dport ${_port} accept" ;;
+        ufw)
+            ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*\[[[:space:]]*[0-9]+\].*${_port}/${_proto}" ;;
+        firewalld)
+            firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1 ;;
+        iptables)
+            iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
+        ip6tables6)
+            ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+_fw_open_port_backend() {
+    local _backend="$1" _port="$2" _proto="${3:-tcp}"
+    if _fw_rule_exists "${_backend}" "${_port}" "${_proto}"; then
+        # pre-existing rule is not script-owned; do not mark it as managed
+        log_info "防火墙端口已存在（未纳入托管）: ${_port}/${_proto} (${_backend})"
+        return 0
     fi
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        if ! ufw status numbered 2>/dev/null | grep -qE "^[[:space:]]*[0-9]+.*${_port}/${_proto}"; then
-            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 && { _fw_mark_rule ufw "${_port}" "${_proto}"; _any=1; }
-        fi
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if ! firewall-cmd --query-port="${_port}/${_proto}" --permanent >/dev/null 2>&1; then
+    case "${_backend}" in
+        nft)
+            _fw_nft_ensure_table 2>/dev/null || return 1
+            nft add rule inet xray2go input "${_proto}" dport "${_port}" accept 2>/dev/null || return 1 ;;
+        ufw)
+            ufw allow "${_port}/${_proto}" >/dev/null 2>&1 || return 1 ;;
+        firewalld)
             firewall-cmd --permanent --add-port="${_port}/${_proto}" >/dev/null 2>&1 && \
-                firewall-cmd --reload >/dev/null 2>&1 && { _fw_mark_rule firewalld "${_port}" "${_proto}"; _any=1; }
-        fi
-    fi
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
-            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null && { _fw_mark_rule iptables "${_port}" "${_proto}"; _any=1; }; }
-        ip6tables -C INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || {
-            ip6tables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null && _fw_mark_rule ip6tables6 "${_port}" "${_proto}" || true; }
-    fi
-    [ "${_any}" -eq 1 ] \
-        && log_ok  "防火墙已开放: ${_port}/${_proto}" \
-        || log_info "防火墙端口已存在: ${_port}/${_proto}"
+                firewall-cmd --reload >/dev/null 2>&1 || return 1 ;;
+        iptables)
+            iptables -I INPUT -p "${_proto}" --dport "${_port}" -j ACCEPT 2>/dev/null || return 1 ;;
+        *) return 1 ;;
+    esac
+    _fw_mark_rule "${_backend}" "${_port}" "${_proto}"
+    log_ok "防火墙已开放: ${_port}/${_proto} (${_backend})"
+}
+
+_fw_open_port() {
+    local _port="$1" _proto="${2:-tcp}" _backend
+    _backend=$(_fw_select_backend)
+    [ "${_backend}" != "none" ] || { log_info "未检测到可用防火墙后端，跳过: ${_port}/${_proto}"; return 0; }
+    _fw_open_port_backend "${_backend}" "${_port}" "${_proto}" || \
+        log_warn "防火墙开放失败: ${_port}/${_proto} (${_backend})"
 }
 
 _fw_close_port() {
@@ -1295,7 +1334,7 @@ _fw_close_port() {
             _fw_unmark_rule ip6tables6 "${_port}" "${_proto}"
         fi
     fi
-    log_info "防火墙规则已删除: ${_port}/${_proto}"
+    log_info "防火墙托管规则已删除: ${_port}/${_proto} (${_backend})"
 }
 
 fw_reconcile() {
@@ -1303,23 +1342,26 @@ fw_reconcile() {
     mkdir -p "${WORK_DIR}"
     local _expected_rules _expected_ports _rule _rp _rb _rproto _want
     _expected_rules=$(fw_desired_rules)
-    _expected_ports=$(printf '%s\n' ${_expected_rules} | cut -d/ -f1 | grep -E '^[0-9]+$' | sort -un || true)
+    _expected_ports=$(printf '%s\n' "${_expected_rules}" | cut -d/ -f1 | grep -E '^[0-9]+$' | sort -un || true)
 
     for _rule in $(_fw_read_managed_rules); do
         _rb=${_rule%%:*}
         _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
         _want="${_rp}/${_rproto}"
-        printf '%s\n' ${_expected_rules} | grep -qx "${_want}" || \
+        printf '%s\n' "${_expected_rules}" | grep -qx "${_want}" || \
             _fw_close_port "${_rp}" "${_rproto}" "${_rb}"
     done
 
-    for _rule in ${_expected_rules}; do
+    while IFS= read -r _rule; do
+        [ -n "${_rule:-}" ] || continue
         _rp=${_rule%/*}; _rproto=${_rule#*/}
         _fw_open_port "${_rp}" "${_rproto}"
-    done
+    done <<EOF
+${_expected_rules}
+EOF
 
     if [ -n "${_expected_ports:-}" ]; then
-        printf '%s\n' ${_expected_ports} > "${_FW_PORTS_FILE}" 2>/dev/null || true
+        printf '%s\n' "${_expected_ports}" > "${_FW_PORTS_FILE}" 2>/dev/null || true
     else
         rm -f "${_FW_PORTS_FILE}" "${_FW_RULES_FILE}" 2>/dev/null || true
     fi
@@ -1327,44 +1369,11 @@ fw_reconcile() {
 
 fw_force_cleanup() {
     log_step "清理 xray2go 托管防火墙规则..."
-    local _ports="" _p
-    [ -f "${_FW_PORTS_FILE}" ] && \
-        _ports=$(grep -E '^[0-9]+$' "${_FW_PORTS_FILE}" 2>/dev/null || true)
-    # 正常情况下只依赖 .fw_ports 删除脚本曾托管的端口；同时合并当前 state 中
-    # 仍处于启用状态的端口，覆盖 .fw_ports 损坏/未写入但本次运行 state 仍可证明
-    # 该端口属于 xray2go 的场景。避免盲删默认 443/8080 等可能由其它服务使用的端口。
-    if [ "$(st_get '.argo.enabled')" = "true" ]; then
-        _ports="${_ports}
-$(port_of argo)"
-    fi
-    if [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" != "none" ]; then
-        _ports="${_ports}
-$(port_of ff)"
-    fi
-    if [ "$(st_get '.reality.enabled')" = "true" ]; then
-        _ports="${_ports}
-$(port_of reality)"
-    fi
-    if [ "$(st_get '.vltcp.enabled')" = "true" ]; then
-        _ports="${_ports}
-$(port_of vltcp)"
-    fi
-    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
-        _ports="${_ports}
-$(port_of vlquic)"
-    fi
-    if [ "$(st_get '.cforigin.enabled')" = "true" ]; then
-        _ports="${_ports}
-$(port_of cforigin)"
-    fi
-    local _uniq _rule _rp _rb _rproto
-    _uniq=$(printf '%s\n' ${_ports} | grep -E '^[0-9]+$' | sort -un)
+    local _rule _rp _rb _rproto
     for _rule in $(_fw_read_managed_rules); do
         _rb=${_rule%%:*}
         _rp=${_rule#*:}; _rproto=${_rp#*/}; _rp=${_rp%/*}
-        if printf '%s\n' ${_uniq} | grep -qx "${_rp}" || [ ! -f "${_FW_PORTS_FILE}" ]; then
-            _fw_close_port "${_rp}" "${_rproto}" "${_rb}" 2>/dev/null || true
-        fi
+        _fw_close_port "${_rp}" "${_rproto}" "${_rb}" 2>/dev/null || true
     done
     if _fw_has_nftables && _fw_nft_table_exists; then
         nft delete table inet xray2go 2>/dev/null || true
@@ -1505,8 +1514,8 @@ svc_reload_xray() {
 # ── 服务单元模板 ──────────────────────────────────────────────────────────────
 
 _svc_tpl_xray_systemd() {
-    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-        "${XRAY_BIN}" "${CONFIG_FILE}"
+    printf '[Unit]\nDescription=Xray2go Service\nDocumentation=https://github.com/XTLS/Xray-core\nAfter=network.target nss-lookup.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectHome=yes\nProtectSystem=full\nReadWritePaths=%s\nExecStart=%s run -c %s\nRestart=always\nRestartSec=3\nRestartPreventExitStatus=23\nLimitNOFILE=1048576\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "${WORK_DIR}" "${XRAY_BIN}" "${CONFIG_FILE}"
 }
 
 _svc_tpl_xray_openrc() {
@@ -1522,11 +1531,11 @@ _svc_tpl_tunnel_systemd() {
     if [ -n "${_token:-}" ] && [ "${_token}" != "null" ] && [ ! -f "${WORK_DIR}/tunnel.json" ]; then
         # token 模式采用 Cloudflare 官方 --token 参数；token 通过 0600 EnvironmentFile 注入，避免写入 unit 和 tunnel.yml。
         # 注意：官方 token CLI 模式会把 token 展开到进程 argv；若本机多用户不可信，请优先使用 credentials/local-managed 模式或加固 /proc 可见性。
-        printf '[Unit]\nDescription=Cloudflare Tunnel2go (token mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=%s\nExecStart=%s tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-            "${_ARGO_ENV_FILE}" "${ARGO_BIN}"
+        printf '[Unit]\nDescription=Cloudflare Tunnel2go (token mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectHome=yes\nProtectSystem=full\nReadWritePaths=%s\nTimeoutStartSec=0\nEnvironmentFile=%s\nExecStart=%s tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "${WORK_DIR}" "${_ARGO_ENV_FILE}" "${ARGO_BIN}"
     else
-        printf '[Unit]\nDescription=Cloudflare Tunnel2go (credentials mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nTimeoutStartSec=0\nEnvironmentFile=-%s\nExecStart=%s tunnel --no-autoupdate --config %s run\nRestart=on-failure\nRestartSec=5\nStandardOutput=null\nStandardError=null\n\n[Install]\nWantedBy=multi-user.target\n' \
-            "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
+        printf '[Unit]\nDescription=Cloudflare Tunnel2go (credentials mode)\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectHome=yes\nProtectSystem=full\nReadWritePaths=%s\nTimeoutStartSec=0\nEnvironmentFile=-%s\nExecStart=%s tunnel --no-autoupdate --config %s run\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "${WORK_DIR}" "${_ARGO_ENV_FILE}" "${ARGO_BIN}" "${WORK_DIR}/tunnel.yml"
     fi
 }
 
@@ -1706,7 +1715,7 @@ _config_apply_inner() {
     fi
 
     local _json; _json=$(cat "${_t}")
-    atomic_write_with_backup "${CONFIG_FILE}" "${_json}" 3 || {
+    atomic_write_with_backup "${CONFIG_FILE}" "${_json}" 2 || {
         log_error "config 写入失败"; return 1; }
     rm -f "${_t}" 2>/dev/null || true
     log_ok "config.json 已原子更新"
@@ -1739,17 +1748,17 @@ config_print_nodes() {
 
 # 组合提交：config_apply + st_persist + fw_reconcile
 _commit() {
-    config_apply  || return 1
-    st_persist    || log_warn "state.json 写入失败"
+    config_apply || return 1
+    st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
     fw_reconcile
 }
 
 _module_disable_commit() {
     local _name="$1"
     config_apply || return 1
-    st_persist   || log_warn "state.json 写入失败"
+    st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
     # 模块禁用/卸载后必须删除对应托管防火墙端口，而不是只让服务不再监听。
-    # fw_reconcile 根据当前启用插件重新计算期望端口，并删除 .fw_ports 中不再期望的规则。
+    # fw_reconcile 根据当前启用插件重新计算期望端口，并删除托管规则中不再期望的规则。
     fw_reconcile
     log_info "${_name} 防火墙端口已从托管规则中删除"
 }
@@ -1853,7 +1862,7 @@ acme_issue_with_ca_fallback() {
         esac
         _issue_rc=$?
         _last_out="${_issue_out}"
-        printf '%s\n' "${_issue_out}"
+        printf '%s\n' "${_issue_out}" | redact_sensitive
         if [ "${_issue_rc}" -eq 0 ]; then
             log_ok "${_label} 签发成功"
             return 0
@@ -1881,7 +1890,10 @@ acme_cf_find_zone() {
     _name="${_domain}"
     while [ -n "${_name:-}" ] && [ "${_name#*.}" != "${_name}" ]; do
         _resp=$(curl -fsS -H "Authorization: Bearer ${_token}" \
-            "https://api.cloudflare.com/client/v4/zones?name=${_name}&status=active&per_page=1" 2>/dev/null) || true
+            --get "https://api.cloudflare.com/client/v4/zones" \
+            --data-urlencode "name=${_name}" \
+            --data-urlencode "status=active" \
+            --data-urlencode "per_page=1" 2>/dev/null) || true
         _zone_id=$(printf '%s' "${_resp:-}" | jq -r 'if .success == true and (.result|length) > 0 then .result[0].id else empty end' 2>/dev/null) || true
         _zone_name=$(printf '%s' "${_resp:-}" | jq -r 'if .success == true and (.result|length) > 0 then .result[0].name else empty end' 2>/dev/null) || true
         if [ -n "${_zone_id:-}" ] && [ -n "${_zone_name:-}" ]; then
@@ -2073,13 +2085,13 @@ cforigin_config_cert() {
     case "${_m:-1}" in
         1)
             local _token
-            prompt "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
+            prompt_secret "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
             acme_issue_cf_token_to_state cforigin "${_domain}" "${_token}" "${_email}" || return 1
             st_set '.cforigin.origin_tls = true' ;;
         2)
             local _cf_key _cf_email
             prompt "Cloudflare 账号邮箱: " _cf_email
-            prompt "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
+            prompt_secret "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
             acme_issue_cf_key_to_state cforigin "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1
             st_set '.cforigin.origin_tls = true' ;;
         3)
@@ -2089,7 +2101,7 @@ cforigin_config_cert() {
         4)
             local _cert _key
             prompt "fullchain.pem 路径: " _cert
-            prompt "privkey.pem 路径: " _key
+            prompt_secret "privkey.pem 路径: " _key
             [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
             [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
             st_set '.cforigin.origin_tls = true | .cforigin.cert = $c | .cforigin.key = $k | .cforigin.acme_method = "manual"' \
@@ -2133,11 +2145,11 @@ vlquic_config_cert() {
         1)
             local _cf_key _cf_email
             prompt "Cloudflare 账号邮箱: " _cf_email
-            prompt "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
+            prompt_secret "Cloudflare Global API Key（不会显示在节点/日志中）: " _cf_key
             acme_issue_cf_key "${_domain}" "${_cf_key}" "${_cf_email}" "${_email}" || return 1 ;;
         2)
             local _token
-            prompt "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
+            prompt_secret "Cloudflare API Token（需 Zone:Read + DNS:Edit，不会显示在节点/日志中）: " _token
             acme_issue_cf_token "${_domain}" "${_token}" "${_email}" || return 1 ;;
         3)
             log_warn "HTTP-01 需要域名 A 记录指向本机且 80/tcp 开放/空闲"
@@ -2145,7 +2157,7 @@ vlquic_config_cert() {
         4)
             local _cert _key
             prompt "fullchain.pem 路径: " _cert
-            prompt "privkey.pem 路径: " _key
+            prompt_secret "privkey.pem 路径: " _key
             [ -f "${_cert}" ] || { log_error "证书文件不存在: ${_cert}"; return 1; }
             [ -f "${_key}" ]  || { log_error "私钥文件不存在: ${_key}"; return 1; }
             st_set '.vlquic.domain = $d | .vlquic.cert = $c | .vlquic.key = $k | .vlquic.acme_method = "manual"' \
@@ -2237,7 +2249,7 @@ argo_apply_fixed_tunnel() {
     printf '%s' "${_domain}" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$' \
         || { log_error "域名格式不合法"; return 1; }
 
-    prompt "请输入 Argo 密钥 (token 或 JSON 内容): " _auth
+    prompt_secret "请输入 Argo 密钥 (token 或 JSON 内容): " _auth
     [ -z "${_auth:-}" ] && { log_error "密钥不能为空"; return 1; }
 
     if printf '%s' "${_auth}" | grep -q "TunnelSecret"; then
@@ -2273,7 +2285,7 @@ argo_apply_fixed_tunnel() {
     svc_reload_daemon
     svc_exec_mut enable "${_SVC_TUNNEL}" 2>/dev/null || true
     config_apply  || return 1
-    st_persist    || log_warn "state.json 写入失败"
+    st_persist    || { log_error "state.json 写入失败"; return 1; }
     # tunnel restart 通过服务互斥接口执行
     svc_exec_mut restart "${_SVC_TUNNEL}" || { log_error "tunnel 重启失败"; return 1; }
     log_ok "固定隧道已配置 (domain=${_domain})"
@@ -2307,7 +2319,7 @@ exec_update_argo_port() {
     argo_sync_tunnel_yml || return 1
     # 2. 重建 xray config（插件读取新端口）并持久化 state
     config_apply || return 1
-    st_persist || log_warn "state.json 写入失败"
+    st_persist || { log_error "state.json 写入失败"; return 1; }
     # 3. 更新 tunnel 服务单元（命令不变，但 env 可能变）
     svc_apply_tunnel || return 1
     svc_reload_daemon
@@ -2465,25 +2477,23 @@ _install_detect_existing_xray() {
 
 _install_check_port_conflicts() {
     log_step "检测端口冲突..."
-    local _proto _port _new
-    for _proto in argo reality vltcp; do
-        # 读取启用状态
-        local _en; _en=$(st_get ".${_proto}.enabled")
-        [ "${_en}" = "true" ] || continue
-        _port=$(port_of "${_proto}")
-        if port_mgr_in_use "${_port}"; then
-            _new=$(port_mgr_random) || return 1
-            st_set ".ports.${_proto} = (\$p|tonumber)" --arg p "${_new}" || return 1
-            log_ok "端口 ${_port} 已占用，自动分配: ${_new}"
-        fi
-    done
-    # ff 端口冲突仅 warn（非独占端口）
-    if [ "$(st_get '.ff.enabled')" = "true" ] && \
-       [ "$(st_get '.ff.protocol')" != "none" ]; then
-        _port=$(port_of ff)
-        port_mgr_in_use "${_port}" && \
-            log_warn "FreeFlow 端口 ${_port} 已被占用，可能无法启动"
-    fi
+    local _rules _rule _port _proto
+    _rules=$(fw_desired_rules)
+    while IFS= read -r _rule; do
+        [ -n "${_rule:-}" ] || continue
+        _port=${_rule%/*}; _proto=${_rule#*/}
+        case "${_proto}" in
+            udp)
+                port_mgr_in_use_udp "${_port}" && \
+                    log_warn "UDP/${_port} 已被占用，相关模块可能无法启动" ;;
+            tcp)
+                port_mgr_in_use "${_port}" && \
+                    log_warn "TCP/${_port} 已被占用，相关模块可能无法启动" ;;
+            *) log_warn "未知端口协议: ${_rule}" ;;
+        esac
+    done <<EOF
+${_rules}
+EOF
     return 0
 }
 
@@ -2580,7 +2590,7 @@ exec_install() {
 
     log_info "网络调优未内置执行：为避免运行未签名第三方 root 脚本，请按需参考可信来源手动配置。"
 
-    st_persist || log_warn "state.json 写入失败（不影响运行）"
+    st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "══ 安装完成 ══"
 }
 
@@ -2914,7 +2924,7 @@ _menu_toggle_xpad() {
     [ "$(xpad_of "${_target}")" = "true" ] && _nxp="false" || _nxp="true"
     st_set ".xpad.${_target} = \$v" --argjson v "${_nxp}" || return 1
     config_apply || return 1
-    st_persist || log_warn "state.json 写入失败"
+    st_persist || { log_error "state.json 写入失败"; return 1; }
     log_ok "${_label} xPadding 已${_nxp}"; config_print_nodes
 }
 
@@ -2985,7 +2995,7 @@ manage_argo() {
                 svc_exec_mut start  "${_SVC_TUNNEL}" \
                     && log_ok "Argo 已启用并启动" \
                     || log_warn "启动失败，请检查域名配置"
-                st_persist || log_warn "state.json 写入失败" ;;
+                st_persist || { log_error "state.json 写入失败"; return 1; } ;;
             2)
                 [ "${_en}" != "true" ] && { log_info "Argo 已禁用"; _pause; continue; }
                 svc_exec_mut stop    "${_SVC_TUNNEL}" 2>/dev/null || true
@@ -3121,7 +3131,7 @@ manage_freeflow() {
                     local _h; prompt "新免流 Host（回车保持 ${_host}）: " _h
                     if [ -n "${_h:-}" ]; then
                         st_set '.ff.host = $h' --arg h "${_h}" || { _pause; continue; }
-                        config_apply && st_persist || true
+                        config_apply && st_persist || { log_error "state.json 写入失败"; return 1; }
                         log_ok "Host 已更新: ${_h}"; config_print_nodes
                     fi
                 else
@@ -3134,7 +3144,7 @@ manage_freeflow() {
                             log_error "path 格式不合法"; _pause; continue
                         fi
                         st_set '.ff.path = $p' --arg p "${_vp2}" || { _pause; continue; }
-                        config_apply && st_persist || true
+                        config_apply && st_persist || { log_error "state.json 写入失败"; return 1; }
                         log_ok "path 已更新: ${_p}"; config_print_nodes
                     fi
                 fi ;;
@@ -3199,7 +3209,7 @@ manage_reality() {
                 fi
                 st_set '.reality.enabled = true' || { _pause; continue; }
                 config_apply || { st_set '.reality.enabled = false'; _pause; continue; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 fw_reconcile
                 log_ok "Reality 已启用"; config_print_nodes ;;
             2)
@@ -3225,7 +3235,7 @@ manage_reality() {
                         || { log_error "SNI 格式不合法"; _pause; continue; }
                     st_set '.reality.sni = $s' --arg s "${_s}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "SNI 已更新: ${_s}"
                     [ "${_en}" = "true" ] && config_print_nodes
                 fi ;;
@@ -3233,7 +3243,7 @@ manage_reality() {
                 local _nn; [ "${_net}" = "tcp" ] && _nn="xhttp" || _nn="tcp"
                 st_set '.reality.network = $n' --arg n "${_nn}" || { _pause; continue; }
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 log_ok "传输方式已切换: ${_nn}"
                 [ "${_en}" = "true" ] && config_print_nodes ;;
             7) _menu_toggle_xpad reality Reality ;;
@@ -3242,7 +3252,7 @@ manage_reality() {
                 crypto_gen_reality_keypair || { _pause; continue; }
                 st_set '.reality.sid = $s' --arg s "$(crypto_gen_reality_sid)" || { _pause; continue; }
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 log_ok "密钥对已更新"
                 [ "${_en}" = "true" ] && config_print_nodes ;;
             a) config_print_nodes ;;
@@ -3285,7 +3295,7 @@ manage_vltcp() {
                 [ "${_en}" = "true" ] && { log_info "VLESS-TCP 已启用"; _pause; continue; }
                 st_set '.vltcp.enabled = true' || { _pause; continue; }
                 config_apply || { st_set '.vltcp.enabled = false'; _pause; continue; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 fw_reconcile
                 log_ok "VLESS-TCP 已启用 (端口: ${_port})"; config_print_nodes ;;
             2)
@@ -3309,7 +3319,7 @@ manage_vltcp() {
                     _l=$(val_listen_addr "${_l}") || { _pause; continue; }
                     st_set '.vltcp.listen = $l' --arg l "${_l}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "监听地址已更新: ${_l}"
                     [ "${_en}" = "true" ] && config_print_nodes
                 fi ;;
@@ -3360,9 +3370,9 @@ manage_vlquic() {
                     vlquic_config_cert || { _pause; continue; }
                 fi
                 st_set '.vlquic.enabled = true' || { _pause; continue; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 fw_reconcile
-                config_apply || { st_set '.vlquic.enabled = false'; st_persist || true; fw_reconcile; _pause; continue; }
+                config_apply || { st_set '.vlquic.enabled = false'; st_persist || { log_error "state.json 写入失败"; return 1; }; fw_reconcile; _pause; continue; }
                 log_ok "VLESS-XHTTP-H3 已启用 (UDP/$(port_of vlquic))"; config_print_nodes ;;
             2)
                 [ "${_en}" != "true" ] && { log_info "VLESS-XHTTP-H3 已禁用"; _pause; continue; }
@@ -3385,13 +3395,13 @@ manage_vlquic() {
                     _l=$(val_listen_addr "${_l}") || { _pause; continue; }
                     st_set '.vlquic.listen = $l' --arg l "${_l}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "监听地址已更新: ${_l}"
                     [ "${_en}" = "true" ] && config_print_nodes
                 fi ;;
             6)
                 vlquic_config_cert || { _pause; continue; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 [ "${_en}" = "true" ] && { fw_reconcile; config_apply || { _pause; continue; }; config_print_nodes; } ;;
             7) config_print_nodes ;;
             0) return ;;
@@ -3464,12 +3474,12 @@ manage_cforigin() {
                 local _pc; prompt "传输协议 (1-3，回车保持 ${_proto}): " _pc
                 case "${_pc:-}" in 1) st_set '.cforigin.protocol = "ws"';; 2) st_set '.cforigin.protocol = "httpupgrade"';; 3) st_set '.cforigin.protocol = "xhttp"';; '') :;; *) log_error "无效选项"; _pause; continue;; esac
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"; [ "${_en}" = "true" ] && config_print_nodes ;;
             5)
                 cforigin_config_cert || { _pause; continue; }
                 [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                st_persist || log_warn "state.json 写入失败"
+                st_persist || { log_error "state.json 写入失败"; return 1; }
                 log_ok "CF Origin 域名/证书已更新"; [ "${_en}" = "true" ] && { config_print_nodes; cforigin_print_cloudflare_hint; } ;;
             6)
                 local _p _vp; prompt "新 path（回车保持 ${_path}）: " _p
@@ -3477,7 +3487,7 @@ manage_cforigin() {
                     _vp=$(val_path "${_p}") || { _pause; continue; }
                     st_set '.cforigin.path = $p' --arg p "${_vp}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "path 已更新: ${_vp}"; [ "${_en}" = "true" ] && config_print_nodes
                 fi ;;
             7)
@@ -3485,7 +3495,7 @@ manage_cforigin() {
                 if [ -n "${_ep:-}" ]; then
                     val_port "${_ep}" >/dev/null && cf_edge_port_valid "${_ep}" || { _pause; continue; }
                     st_set '.cforigin.edge_port = ($p|tonumber)' --arg p "${_ep}" || { _pause; continue; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "Edge 入口端口已更新: ${_ep}"; config_print_nodes; cforigin_print_cloudflare_hint
                 fi ;;
             8)
@@ -3510,7 +3520,7 @@ manage_cforigin() {
                     _l=$(val_listen_addr "${_l}") || { _pause; continue; }
                     st_set '.cforigin.listen = $l' --arg l "${_l}" || { _pause; continue; }
                     [ "${_en}" = "true" ] && { config_apply || { _pause; continue; }; }
-                    st_persist || log_warn "state.json 写入失败"
+                    st_persist || { log_error "state.json 写入失败"; return 1; }
                     log_ok "监听地址已更新: ${_l}"
                 fi ;;
             b) config_print_nodes; cforigin_print_cloudflare_hint ;;
@@ -3629,7 +3639,7 @@ _menu_do_install() {
         log_error "安装失败"; _pause; return
     fi
 
-    st_persist || log_warn "state.json 写入失败"
+    st_persist || { log_error "state.json 写入失败"; return 1; }
 
     [ "$(st_get '.argo.enabled')" = "true" ] && \
         { argo_apply_fixed_tunnel || \
