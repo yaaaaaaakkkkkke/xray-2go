@@ -190,6 +190,8 @@ def test_single_file_module_dispatch_actions():
         assert_true(token in dispatch_body, f"module_dispatch action route missing: {token}")
     for fn in ['module_xray_install()', 'module_xray_uninstall()', 'module_nodes_show()', 'module_config_update_uuid()', 'module_config_update_shortcut()', 'module_xray_restart()', 'module_argo_restart()', 'module_show_nodes()', 'module_cforigin_show()']:
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
+    for marker in ['# core/global actions', '# module menu entrypoints', '# shared runtime actions', '# lifecycle actions', '# uninstall/update-port actions', '# field/config update actions', '# key/toggle actions', '# complex/specialized actions']:
+        assert_true(marker in dispatch_body, f"module_dispatch should be grouped for readability: {marker}")
     xray_install_body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
     xray_uninstall_body = TEXT[TEXT.index('module_xray_uninstall()'):TEXT.index('\n}\n', TEXT.index('module_xray_uninstall()'))]
     config_uuid_body = TEXT[TEXT.index('module_config_update_uuid()'):TEXT.index('\n}\n', TEXT.index('module_config_update_uuid()'))]

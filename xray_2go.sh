@@ -3484,18 +3484,23 @@ module_argo_restart() {
 module_dispatch() {
     local _mod="${1:-}" _action="${2:-menu}"
     case "${_mod}:${_action}" in
+        # core/global actions
         xray:install) module_xray_install ;;
         xray:uninstall) module_xray_uninstall ;;
         nodes:show) module_nodes_show ;;
         config:update_uuid) module_config_update_uuid ;;
         config:update_shortcut) module_config_update_shortcut ;;
+
+        # module menu entrypoints
         argo:menu)     manage_argo ;;
         ff:menu)       manage_freeflow ;;
         reality:menu)  manage_reality ;;
         vltcp:menu)    manage_vltcp ;;
         vlquic:menu)   manage_vlquic ;;
         cforigin:menu) manage_cforigin ;;
-        argo:restart)  module_argo_restart ;;
+
+        # shared runtime actions
+        argo:restart) module_argo_restart ;;
         ff:restart) module_xray_restart ;;
         reality:restart) module_xray_restart ;;
         vltcp:restart) module_xray_restart ;;
@@ -3507,44 +3512,54 @@ module_dispatch() {
         vltcp:show) module_show_nodes ;;
         vlquic:show) module_show_nodes ;;
         cforigin:show) module_cforigin_show ;;
+
+        # lifecycle actions
+        argo:enable) module_argo_enable ;;
+        argo:disable) module_argo_disable ;;
         ff:enable) module_ff_enable ;;
         ff:disable) module_ff_disable ;;
         reality:enable) module_reality_enable ;;
         reality:disable) module_reality_disable ;;
         vltcp:enable) module_vltcp_enable ;;
         vltcp:disable) module_vltcp_disable ;;
+        vlquic:enable) module_vlquic_enable ;;
+        vlquic:disable) module_vlquic_disable ;;
         cforigin:enable) module_cforigin_enable ;;
         cforigin:disable) module_cforigin_disable ;;
+
+        # uninstall/update-port actions
+        argo:uninstall) module_argo_uninstall ;;
         ff:uninstall) module_ff_uninstall ;;
         reality:uninstall) module_reality_uninstall ;;
         vltcp:uninstall) module_vltcp_uninstall ;;
         vlquic:uninstall) module_vlquic_uninstall ;;
         cforigin:uninstall) module_cforigin_uninstall ;;
+        argo:update_port) module_argo_update_port ;;
+        ff:update_port) module_ff_update_port ;;
         vlquic:update_port) module_vlquic_update_port ;;
         cforigin:update_port) module_cforigin_update_port ;;
+
+        # field/config update actions
+        argo:update_protocol) module_argo_update_protocol ;;
+        ff:update_mode) module_ff_update_mode ;;
+        ff:update_host_or_path) module_ff_update_host_or_path ;;
         reality:update_transport) module_reality_update_transport ;;
         vltcp:update_listen) module_vltcp_update_listen ;;
         vlquic:update_listen) module_vlquic_update_listen ;;
         cforigin:update_protocol) module_cforigin_update_protocol ;;
         cforigin:update_path) module_cforigin_update_path ;;
         cforigin:update_listen) module_cforigin_update_listen ;;
-        argo:enable) module_argo_enable ;;
-        argo:disable) module_argo_disable ;;
-        argo:uninstall) module_argo_uninstall ;;
-        argo:update_protocol) module_argo_update_protocol ;;
-        argo:update_port) module_argo_update_port ;;
-        ff:update_mode) module_ff_update_mode ;;
-        ff:update_host_or_path) module_ff_update_host_or_path ;;
-        ff:update_port) module_ff_update_port ;;
+
+        # key/toggle actions
         reality:update_sni) module_reality_update_sni ;;
         reality:regenerate_keys) module_reality_regenerate_keys ;;
-        vlquic:enable) module_vlquic_enable ;;
-        vlquic:disable) module_vlquic_disable ;;
+
+        # complex/specialized actions
         vlquic:update_cert) module_vlquic_update_cert ;;
         cforigin:update_cert) module_cforigin_update_cert ;;
         cforigin:update_edge_port) module_cforigin_update_edge_port ;;
         cforigin:toggle_edge_h3) module_cforigin_toggle_edge_h3 ;;
-        *)             log_error "未知模块动作: ${_mod}:${_action}"; return 1 ;;
+        *) log_error "未知模块动作: ${_mod}:${_action}"; return 1 ;;
     esac
 }
 
