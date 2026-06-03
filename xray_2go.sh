@@ -3129,12 +3129,12 @@ module_xray_uninstall() {
     log_ok "xray2go 卸载完成"
 }
 
-exec_update_shortcut() {
+module_config_update_shortcut() {
     log_warn "已禁用内置自更新：为避免未签名 root 脚本覆盖，请通过 GitHub Release/包管理器等可校验渠道手动更新。"
     return 1
 }
 
-exec_update_uuid() {
+module_config_update_uuid() {
     [ -f "${CONFIG_FILE}" ] || { log_warn "请先安装 Xray-2go"; return 1; }
     local _v; prompt "新 UUID（回车自动生成）: " _v
     if [ -z "${_v:-}" ]; then
@@ -3473,14 +3473,6 @@ module_nodes_show() {
     fi
     log_warn "Xray-2go 未安装或未运行"
     return 1
-}
-
-module_config_update_uuid() {
-    [ -f "${CONFIG_FILE}" ] && exec_update_uuid || log_warn "请先安装 Xray-2go"
-}
-
-module_config_update_shortcut() {
-    exec_update_shortcut
 }
 
 module_xray_restart() {
