@@ -322,6 +322,14 @@ def test_state_schema_and_plugin_permission_hardening():
     assert_true('val_port "${_value}"' in TEXT and 'legacy 端口字段非法' in TEXT, "legacy port migration must validate bad values explicitly")
 
 
+def test_commit_helpers_fail_closed_on_firewall_reconcile():
+    for fn in ['_commit', '_module_enable_commit', '_module_disable_commit']:
+        m = re.search(rf"{re.escape(fn)}\(\) \{{(?P<body>.*?)\n\}}", TEXT, re.S)
+        assert_true(m, f'{fn} function missing')
+        body = m.group('body')
+        assert_true('fw_reconcile || return 1' in body, f'{fn} must fail closed if firewall reconciliation fails')
+
+
 def test_socks5_module_option_and_plugin_contract():
     assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
     assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"' in TEXT, "module registry must include socks")

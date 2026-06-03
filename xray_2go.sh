@@ -1922,7 +1922,7 @@ config_print_nodes() {
 _commit() {
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
-    fw_reconcile
+    fw_reconcile || return 1
 }
 
 _module_disable_commit() {
@@ -1931,7 +1931,7 @@ _module_disable_commit() {
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
     # 模块禁用/卸载后必须删除对应托管防火墙端口，而不是只让服务不再监听。
     # fw_reconcile 根据当前启用插件重新计算期望端口，并删除托管规则中不再期望的规则。
-    fw_reconcile
+    fw_reconcile || return 1
     log_info "${_name} 防火墙端口已从托管规则中删除"
 }
 
@@ -1939,7 +1939,7 @@ _module_enable_commit() {
     local _name="$1"
     config_apply || return 1
     st_persist   || { log_error "state.json 写入失败，拒绝同步防火墙以避免状态漂移"; return 1; }
-    fw_reconcile
+    fw_reconcile || return 1
     log_ok "${_name} 已启用"
     config_print_nodes
 }
