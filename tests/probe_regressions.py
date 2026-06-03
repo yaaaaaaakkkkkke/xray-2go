@@ -241,6 +241,8 @@ def test_single_file_module_argo_freeflow_actions():
         assert_true(token in dispatch_body, f"module_dispatch Argo/FreeFlow route missing: {token}")
     for fn in ['module_argo_enable()', 'module_argo_disable()', 'module_argo_uninstall()', 'module_argo_update_protocol()', 'module_argo_update_port()', 'module_ff_update_mode()', 'module_ff_update_host_or_path()', 'module_ff_update_port()']:
         assert_true(fn in TEXT, f"Argo/FreeFlow action helper missing: {fn}")
+    argo_update_port_body = TEXT[TEXT.index('module_argo_update_port()'):TEXT.index('\n}\n', TEXT.index('module_argo_update_port()'))]
+    assert_true('exec_update_argo_port()' not in TEXT and 'exec_update_argo_port' not in argo_update_port_body, "Argo port workflow should live in module_argo_update_port, not an exec wrapper")
     for marker in ['_module_action_or_continue argo enable', '_module_action_or_continue argo disable', '_module_action_or_continue argo uninstall', '_module_action_or_continue argo update_protocol', '_module_action_or_continue argo update_port', '_module_action_or_continue ff update_mode', '_module_action_or_continue ff update_host_or_path', '_module_action_or_continue ff update_port']:
         assert_true(marker in TEXT, f"menu should route Argo/FreeFlow action through dispatcher: {marker}")
 

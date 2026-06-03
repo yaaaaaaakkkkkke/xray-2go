@@ -2138,10 +2138,6 @@ module_argo_update_protocol() {
     argo_apply_fixed_tunnel && config_print_nodes || { log_error "固定隧道配置失败"; return 1; }
 }
 
-module_argo_update_port() {
-    exec_update_argo_port
-}
-
 module_ff_update_mode() {
     ask_freeflow_mode || return 1
     [ "$(st_get '.ff.enabled')" = "true" ] || return 1
@@ -2724,7 +2720,7 @@ _argo_gen_yml_token() {
 }
 
 # 统一同步入口：cred 模式重建 tunnel.yml；token/remote-managed 模式仅校验并提示远端 ingress。
-# 调用方：exec_update_argo_port / svc_apply_tunnel / _commit 后的端口变更
+# 调用方：module_argo_update_port / svc_apply_tunnel / _commit 后的端口变更
 argo_sync_tunnel_yml() {
     [ "$(st_get '.argo.enabled')" = "true" ] || return 0
     local _domain; _domain=$(st_get '.argo.domain')
@@ -2821,7 +2817,7 @@ argo_check_health() {
 }
 
 # 修改 Argo 端口：同步 xray inbound；cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式提示远端同步
-exec_update_argo_port() {
+module_argo_update_port() {
     local _p; _menu_input_port '.ports.argo' _p || return 1
     # 1. cred/local-managed 模式同步 tunnel.yml；token/remote-managed 模式仅校验并提示 Cloudflare 远端 ingress
     argo_sync_tunnel_yml || return 1
