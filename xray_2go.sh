@@ -3483,10 +3483,6 @@ module_config_update_shortcut() {
     exec_update_shortcut
 }
 
-module_xray_install() {
-    _menu_do_install
-}
-
 module_xray_uninstall() {
     exec_uninstall
 }
@@ -4116,7 +4112,7 @@ _menu_render() {
     printf "  ${C_RED}0.${C_RST} 退出\n\n"
 }
 
-_menu_do_install() {
+module_xray_install() {
     if [ "${_MENU_XI}" -eq 1 ]; then
         if [ "${_MENU_CX}" -eq 0 ]; then
             log_warn "Xray-2go 已安装并运行，如需重装请先卸载 (选项 2)"; return
