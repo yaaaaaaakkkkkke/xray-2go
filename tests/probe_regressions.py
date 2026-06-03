@@ -286,6 +286,10 @@ def test_single_file_module_transaction_helpers():
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_module_enable_commit' in body or 'module_dispatch' in body or '_module_action_or_continue' in body, f"{body_name} enable path should use shared transaction helper or dispatcher")
     assert_true('_module_apply_if_enabled "${_en}"' in TEXT, "enabled-only config updates should use shared apply helper")
+    assert_true('_module_persist_after_optional_apply()' in TEXT, "enabled-only update persistence should use shared optional-apply commit helper")
+    for fn in ['module_reality_update_transport()', 'module_vltcp_update_listen()', 'module_vlquic_update_listen()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()']:
+        body = TEXT[TEXT.index(fn):TEXT.index('\n}\n', TEXT.index(fn))]
+        assert_true('_module_persist_after_optional_apply "${_en}"' in body, f"{fn} should use shared optional-apply commit helper")
 
 
 def test_protocol_links_and_udp_port_input_consistency():

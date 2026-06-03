@@ -1889,6 +1889,12 @@ _module_apply_if_enabled() {
     [ "${_enabled}" = "true" ] && config_apply || return 0
 }
 
+_module_persist_after_optional_apply() {
+    local _enabled="$1"
+    _module_apply_if_enabled "${_enabled}" || return 1
+    st_persist || { log_error "state.json 写入失败"; return 1; }
+}
+
 module_ff_enable() {
     ask_freeflow_mode || return 1
     [ "$(st_get '.ff.enabled')" = "true" ] || return 1
@@ -2004,8 +2010,7 @@ module_reality_update_transport() {
     _net=$(st_get '.reality.network'); _net="${_net:-tcp}"
     [ "${_net}" = "tcp" ] && _nn="xhttp" || _nn="tcp"
     st_set '.reality.network = $n' --arg n "${_nn}" || return 1
-    _module_apply_if_enabled "${_en}" || return 1
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "传输方式已切换: ${_nn}"
     [ "${_en}" = "true" ] && config_print_nodes
 }
@@ -2017,8 +2022,7 @@ module_vltcp_update_listen() {
     [ -n "${_l:-}" ] || return 0
     _l=$(val_listen_addr "${_l}") || return 1
     st_set '.vltcp.listen = $l' --arg l "${_l}" || return 1
-    [ "${_en}" = "true" ] && { config_apply || return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "监听地址已更新: ${_l}"
     [ "${_en}" = "true" ] && config_print_nodes
 }
@@ -2030,8 +2034,7 @@ module_vlquic_update_listen() {
     [ -n "${_l:-}" ] || return 0
     _l=$(val_listen_addr "${_l}") || return 1
     st_set '.vlquic.listen = $l' --arg l "${_l}" || return 1
-    [ "${_en}" = "true" ] && { config_apply || return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "监听地址已更新: ${_l}"
     [ "${_en}" = "true" ] && config_print_nodes
 }
@@ -2049,8 +2052,7 @@ module_cforigin_update_protocol() {
         '') : ;;
         *) log_error "无效选项"; return 1 ;;
     esac
-    [ "${_en}" = "true" ] && { config_apply || return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "CF Origin 协议已更新: $(st_get '.cforigin.protocol')"
     [ "${_en}" = "true" ] && config_print_nodes
 }
@@ -2063,8 +2065,7 @@ module_cforigin_update_path() {
     [ -n "${_p:-}" ] || return 0
     _vp=$(val_path "${_p}") || return 1
     st_set '.cforigin.path = $p' --arg p "${_vp}" || return 1
-    [ "${_en}" = "true" ] && { config_apply || return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "path 已更新: ${_vp}"
     [ "${_en}" = "true" ] && config_print_nodes
 }
