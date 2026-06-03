@@ -310,7 +310,8 @@ readonly _STATE_DEFAULT='{
     "reality": 443,
     "vltcp":   1234,
     "vlquic":  443,
-    "cforigin": 28888
+    "cforigin": 28888,
+    "socks":   1080
   },
   "argo": {
     "enabled":  true,
@@ -336,6 +337,12 @@ readonly _STATE_DEFAULT='{
   "vltcp": {
     "enabled": false,
     "listen":  "0.0.0.0"
+  },
+  "socks": {
+    "enabled": false,
+    "listen":  "0.0.0.0",
+    "user":    "xray2go",
+    "pass":    "xray2go"
   },
   "vlquic": {
     "enabled": false,
@@ -587,18 +594,19 @@ st_persist() { with_lock _st_persist_inner; }
 _st_normalize_schema() {
 
     # 规范化端口字段到顶层 ports
-    local _ap _rp _vp _qp _fp _cp
+    local _ap _rp _vp _qp _fp _cp _sp
     _ap=$(st_get '.argo.port    // empty')
     _rp=$(st_get '.reality.port // empty')
     _vp=$(st_get '.vltcp.port   // empty')
     _qp=$(st_get '.vlquic.port  // empty')
     _fp=$(st_get '.ff.port      // empty')
     _cp=$(st_get '.cforigin.port // empty')
+    _sp=$(st_get '.socks.port   // empty')
 
     # 若 .ports 不存在则初始化
     local _ports; _ports=$(st_get '.ports')
     if [ -z "${_ports:-}" ] || [ "${_ports}" = "null" ]; then
-        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888}'
+        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080}'
     fi
 
     _st_migrate_port() {
@@ -619,6 +627,7 @@ _st_normalize_schema() {
     _st_migrate_port '.vlquic.port' '.ports.vlquic' "${_qp}"
     _st_migrate_port '.ff.port' '.ports.ff' "${_fp}"
     _st_migrate_port '.cforigin.port' '.ports.cforigin' "${_cp}"
+    _st_migrate_port '.socks.port' '.ports.socks' "${_sp}"
 
     # 补全缺失/损坏端口字段，避免菜单显示 0 或修改端口后写入无效路径
     local _c
@@ -634,6 +643,8 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.vlquic = 443'
     _c=$(st_get '.ports.cforigin')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.cforigin = 28888'
+    _c=$(st_get '.ports.socks')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.socks = 1080'
 
     _c=$(st_get '.reality.network')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
@@ -662,6 +673,14 @@ _st_normalize_schema() {
         st_set '.xpad.reality = true'
     _c=$(st_get '.vltcp.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vltcp.listen = "0.0.0.0"'
+    _c=$(st_get '.socks.enabled')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.enabled = false'
+    _c=$(st_get '.socks.listen')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.listen = "0.0.0.0"'
+    _c=$(st_get '.socks.user')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.user = "xray2go"'
+    _c=$(st_get '.socks.pass')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.pass = "xray2go"'
     _c=$(st_get '.vlquic.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.listen = "0.0.0.0"'
     _c=$(st_get '.vlquic.domain')
@@ -800,6 +819,7 @@ plugin_install_builtins() {
     _plugin_write_ff
     _plugin_write_reality
     _plugin_write_vltcp
+    _plugin_write_socks
     _plugin_write_vlquic
     _plugin_write_cforigin
 }
@@ -1106,6 +1126,47 @@ _plg_vltcp_link() {
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/vltcp.sh"
+}
+
+
+_plugin_write_socks() {
+cat > "${PLUGIN_DIR}/socks.sh" << 'PLUGIN_EOF'
+# xray-2go plugin: socks (SOCKS5 inbound)
+
+_plg_socks_enabled() {
+    [ "$(st_get '.socks.enabled')" = "true" ]
+}
+
+_plg_socks_ports() {
+    _plg_socks_enabled || return 0
+    port_of socks
+}
+
+_plg_socks_inbound() {
+    _plg_socks_enabled || return 0
+    local _port _listen _user _pass
+    _port=$(port_of socks)
+    _listen=$(st_get '.socks.listen')
+    _user=$(st_get '.socks.user')
+    _pass=$(st_get '.socks.pass')
+    jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg user "${_user}" --arg pass "${_pass}" '{
+        port:$port, listen:$listen, protocol:"socks",
+        settings:{auth:"password", accounts:[{user:$user, pass:$pass}], udp:false}
+    }'
+}
+
+_plg_socks_link() {
+    _plg_socks_enabled || return 0
+    local _ip _port _user _pass _u _pw
+    _ip=$(platform_get_realip)
+    [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，SOCKS5 节点已跳过"; return 0; }
+    _port=$(port_of socks)
+    _user=$(urlencode_path "$(st_get '.socks.user')")
+    _pass=$(urlencode_path "$(st_get '.socks.pass')")
+    printf 'socks://%s:%s@%s:%s#SOCKS5\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
+}
+PLUGIN_EOF
+    chmod 644 "${PLUGIN_DIR}/socks.sh"
 }
 
 _plugin_write_cforigin() {
@@ -1937,6 +1998,19 @@ module_vltcp_disable() {
     log_ok "VLESS-TCP 已禁用"
 }
 
+
+module_socks_enable() {
+    ask_socks_mode || return 1
+    [ "$(st_get '.socks.enabled')" = "true" ] || return 1
+    _module_enable_commit SOCKS5 || { st_set '.socks.enabled = false'; return 1; }
+}
+
+module_socks_disable() {
+    st_set '.socks.enabled = false' || return 1
+    _module_disable_commit SOCKS5 || return 1
+    log_ok "SOCKS5 已禁用"
+}
+
 module_cforigin_enable() {
     ask_cforigin_mode enabled || return 1
     [ "$(st_get '.cforigin.enabled')" = "true" ] || return 1
@@ -1967,6 +2041,43 @@ module_vltcp_uninstall() {
     st_set '.ports.vltcp = 1234' || return 1
     _module_disable_commit VLESS-TCP || return 1
     log_ok "VLESS-TCP 已卸载"
+}
+
+
+module_socks_uninstall() {
+    st_set '.socks.enabled = false | .socks.listen = "0.0.0.0" | .socks.user = "xray2go" | .socks.pass = "xray2go" | .ports.socks = 1080' || return 1
+    _module_disable_commit SOCKS5 || return 1
+    log_ok "SOCKS5 已卸载"
+}
+
+module_socks_update_port() {
+    _menu_update_port socks tcp
+}
+
+module_socks_update_listen() {
+    local _en _l
+    _en=$(st_get '.socks.enabled')
+    prompt "新监听地址（0.0.0.0=所有，127.0.0.1=仅本地）: " _l
+    [ -n "${_l:-}" ] || return 0
+    _l=$(val_listen_addr "${_l}") || return 1
+    st_set '.socks.listen = $l' --arg l "${_l}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "SOCKS5 监听地址已更新: ${_l}"
+    [ "${_en}" = "true" ] && config_print_nodes
+}
+
+module_socks_update_auth() {
+    local _en _user _pass _du
+    _en=$(st_get '.socks.enabled')
+    _du=$(st_get '.socks.user')
+    prompt "新用户名（回车保持 ${_du}）: " _user
+    _user="${_user:-${_du}}"
+    prompt_secret "新密码（回车保持当前）: " _pass
+    [ -z "${_pass:-}" ] && _pass=$(st_get '.socks.pass')
+    st_set '.socks.user = $u | .socks.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "SOCKS5 账号已更新: ${_user}"
+    [ "${_en}" = "true" ] && config_print_nodes
 }
 
 module_vlquic_uninstall() {
@@ -3283,6 +3394,45 @@ ask_vltcp_mode() {
 }
 
 
+
+ask_socks_mode() {
+    echo ""; log_title "SOCKS5 入站（账号密码）"
+    printf "  ${C_GRN}1.${C_RST} 启用 SOCKS5
+"
+    printf "  ${C_GRN}2.${C_RST} 不启用 ${C_YLW}[默认]${C_RST}
+"
+    local _c; prompt "请选择 (1-2，回车默认2): " _c
+    case "${_c:-2}" in
+        1) st_set '.socks.enabled = true';;
+        *) st_set '.socks.enabled = false'; log_info "不启用 SOCKS5"; echo ""; return 0;;
+    esac
+
+    local _dp; _dp=$(port_of socks)
+    local _sp; prompt "监听端口（回车默认 ${_dp}）: " _sp
+    if [ -n "${_sp:-}" ]; then
+        if val_port "${_sp}" >/dev/null 2>&1; then
+            st_set '.ports.socks = ($p|tonumber)' --arg p "${_sp}"
+        else
+            log_warn "端口无效，使用默认值 ${_dp}"
+        fi
+    fi
+    port_mgr_in_use "$(port_of socks)" && log_warn "TCP/$(port_of socks) 已被占用"
+
+    local _dl; _dl=$(st_get '.socks.listen')
+    local _sl; prompt "监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _sl
+    [ -n "${_sl:-}" ] && { _sl=$(val_listen_addr "${_sl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; _sl="${_dl}"; }; st_set '.socks.listen = $l' --arg l "${_sl}"; }
+
+    local _du _user _pass
+    _du=$(st_get '.socks.user')
+    prompt "SOCKS5 用户名（回车默认 ${_du}）: " _user
+    _user="${_user:-${_du}}"
+    prompt_secret "SOCKS5 密码（回车保持当前/默认）: " _pass
+    [ -z "${_pass:-}" ] && _pass=$(st_get '.socks.pass')
+    st_set '.socks.user = $u | .socks.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
+    log_info "SOCKS5 配置完成 — 端口:$(port_of socks) 监听:$(st_get '.socks.listen') 用户:$(st_get '.socks.user')"
+    echo ""
+}
+
 ask_cforigin_mode() {
     local _skip_enable="${1:-}"
     echo ""; log_title "Cloudflare Origin 端口回源"
@@ -3394,7 +3544,7 @@ ask_xpad_mode() {
 
 # ── 单文件模块注册表 / 管理子菜单辅助 ─────────────────────────────────────────
 
-_MODULE_IDS="argo ff reality vltcp vlquic cforigin"
+_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"
 
 module_label() {
     case "${1:-}" in
@@ -3404,6 +3554,7 @@ module_label() {
         vltcp)    printf 'VLESS-TCP' ;;
         vlquic)   printf 'VLESS-XHTTP-H3' ;;
         cforigin) printf 'CF Origin' ;;
+        socks)    printf 'SOCKS5' ;;
         *)        printf '%s' "${1:-unknown}" ;;
     esac
 }
@@ -3498,6 +3649,7 @@ module_dispatch() {
         vltcp:menu)    manage_vltcp ;;
         vlquic:menu)   manage_vlquic ;;
         cforigin:menu) manage_cforigin ;;
+        socks:menu)     manage_socks ;;
 
         # shared runtime actions
         argo:restart) module_argo_restart ;;
@@ -3512,6 +3664,7 @@ module_dispatch() {
         vltcp:show) module_show_nodes ;;
         vlquic:show) module_show_nodes ;;
         cforigin:show) module_cforigin_show ;;
+        socks:show) module_show_nodes ;;
 
         # lifecycle actions
         argo:enable) module_argo_enable ;;
@@ -3526,6 +3679,8 @@ module_dispatch() {
         vlquic:disable) module_vlquic_disable ;;
         cforigin:enable) module_cforigin_enable ;;
         cforigin:disable) module_cforigin_disable ;;
+        socks:enable) module_socks_enable ;;
+        socks:disable) module_socks_disable ;;
 
         # uninstall/update-port actions
         argo:uninstall) module_argo_uninstall ;;
@@ -3534,10 +3689,12 @@ module_dispatch() {
         vltcp:uninstall) module_vltcp_uninstall ;;
         vlquic:uninstall) module_vlquic_uninstall ;;
         cforigin:uninstall) module_cforigin_uninstall ;;
+        socks:uninstall) module_socks_uninstall ;;
         argo:update_port) module_argo_update_port ;;
         ff:update_port) module_ff_update_port ;;
         vlquic:update_port) module_vlquic_update_port ;;
         cforigin:update_port) module_cforigin_update_port ;;
+        socks:update_port) module_socks_update_port ;;
 
         # field/config update actions
         argo:update_protocol) module_argo_update_protocol ;;
@@ -3549,6 +3706,8 @@ module_dispatch() {
         cforigin:update_protocol) module_cforigin_update_protocol ;;
         cforigin:update_path) module_cforigin_update_path ;;
         cforigin:update_listen) module_cforigin_update_listen ;;
+        socks:update_listen) module_socks_update_listen ;;
+        socks:update_auth) module_socks_update_auth ;;
 
         # key/toggle actions
         reality:update_sni) module_reality_update_sni ;;
@@ -3994,6 +4153,58 @@ manage_vlquic() {
 }
 
 
+
+# ── SOCKS5 管理 ───────────────────────────────────────────────────────────────
+
+manage_socks() {
+    _manage_module_entry_check || return
+    while true; do
+        local _en _port _listen _user _xstat
+        _en=$(    st_get '.socks.enabled')
+        _port=$(  port_of socks)
+        _listen=$(st_get '.socks.listen')
+        _user=$(  st_get '.socks.user')
+        _xstat=$(_xray_runtime_status)
+
+        clear; echo ""; log_title "══ SOCKS5 管理 ══"
+        _menu_print_module_status "${_en}" "${_xstat}"
+        printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}  用户: ${C_GRN}%s${C_RST}
+" "${_port}" "${_listen}" "${_user}"
+        _hr
+        _menu_print_action 1 "启用 SOCKS5"
+        _menu_print_action 2 "禁用 SOCKS5" "${C_RED}"
+        _menu_print_action 3 "重启 xray2go 服务"
+        _menu_print_action 9 "卸载 SOCKS5" "${C_RED}"
+        _hr
+        _menu_print_action 4 "修改端口（当前: ${C_YLW}${_port}${C_RST}）"
+        _menu_print_action 5 "修改监听地址（当前: ${C_CYN}${_listen}${C_RST}）"
+        _menu_print_action 6 "修改用户名/密码"
+        _menu_print_action 7 "查看节点链接"
+        _menu_print_back; _hr
+        local _c; prompt "请输入选择: " _c
+        case "${_c:-}" in
+            1)
+                [ "${_en}" = "true" ] && { log_info "SOCKS5 已启用"; _pause; continue; }
+                _module_action_or_continue socks enable || continue ;;
+            2)
+                [ "${_en}" != "true" ] && { log_info "SOCKS5 已禁用"; _pause; continue; }
+                _module_action_or_continue socks disable || continue ;;
+            3) _module_action_or_continue socks restart || continue ;;
+            9)
+                _menu_confirm_uninstall "SOCKS5" || { _pause; continue; }
+                _module_action_or_continue socks uninstall || continue
+                _pause; return ;;
+            4) _module_action_or_continue socks update_port || continue ;;
+            5) _module_action_or_continue socks update_listen || continue ;;
+            6) _module_action_or_continue socks update_auth || continue ;;
+            7) _module_action_or_continue socks show || continue ;;
+            0) return ;;
+            *) log_error "无效选项" ;;
+        esac
+        _pause
+    done
+}
+
 # ── Cloudflare Origin 回源管理 ────────────────────────────────────────────────
 
 manage_cforigin() {
@@ -4082,6 +4293,7 @@ _menu_collect_status() {
     _MENU_VD=$(module_summary vltcp)
     _MENU_QD=$(module_summary vlquic)
     _MENU_CD=$(module_summary cforigin)
+    _MENU_SD=$(module_summary socks)
 }
 
 _menu_render() {
@@ -4096,6 +4308,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  XHTTP-H3 : %-29s${C_PUR} ${C_RST}\n" "${_MENU_QD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  CF-Origin: %-29s${C_PUR} ${C_RST}\n" "${_MENU_CD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
+    printf "${C_BOLD}${C_PUR}  ║${C_RST}  SOCKS5   : %-29s${C_PUR} ${C_RST}\n" "${_MENU_SD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 安装 Xray-2go\n"
     printf "  ${C_RED}2.${C_RST} 卸载 Xray-2go\n"; _hr
@@ -4104,7 +4317,8 @@ _menu_render() {
     printf "  ${C_GRN}5.${C_RST} VLESS-TCP 管理\n"
     printf "  ${C_GRN}6.${C_RST} VLESS-XHTTP-H3 管理\n"
     printf "  ${C_GRN}7.${C_RST} FreeFlow 管理\n"
-    printf "  ${C_GRN}8.${C_RST} CF Origin 回源管理\n"; _hr
+    printf "  ${C_GRN}8.${C_RST} CF Origin 回源管理\n"
+    printf "  ${C_GRN}11.${C_RST} SOCKS5 管理\n"; _hr
     printf "  ${C_GRN}9.${C_RST} 查看节点\n"
     printf "  ${C_GRN}10.${C_RST} 修改 UUID\n"
     printf "  ${C_GRN}s.${C_RST} 快捷方式/脚本更新\n"; _hr
@@ -4124,6 +4338,7 @@ module_xray_install() {
     ask_freeflow_mode
     ask_reality_mode
     ask_vltcp_mode
+    ask_socks_mode
     ask_vlquic_mode
     ask_cforigin_mode
 
@@ -4161,11 +4376,11 @@ module_xray_install() {
 
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD=""
+    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD=""
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请输入选择 (0-10/s): " _c; echo ""
+        local _c; prompt "请输入选择 (0-11/s): " _c; echo ""
         case "${_c:-}" in
             1) module_dispatch xray install ;;
             2) module_dispatch xray uninstall ;;
@@ -4175,11 +4390,12 @@ menu() {
             6) module_dispatch vlquic ;;
             7) module_dispatch ff ;;
             8) module_dispatch cforigin ;;
+            11) module_dispatch socks ;;
             9) module_dispatch nodes show ;;
             10) module_dispatch config update_uuid ;;
             s) module_dispatch config update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-10 或 s" ;;
+            *) log_error "无效选项，请输入 0-11 或 s" ;;
         esac
         _pause
     done

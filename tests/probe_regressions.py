@@ -171,10 +171,10 @@ def test_menu_status_and_commit_helpers_are_shared():
 
 
 def test_single_file_module_registry_drives_main_status():
-    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin"' in TEXT, "single-file module registry must list all modules")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"' in TEXT, "single-file module registry must list all modules")
     assert_true('module_summary()' in TEXT and 'module_label()' in TEXT, "module metadata helpers missing")
     collect_body = TEXT[TEXT.index('_menu_collect_status()'):TEXT.index('_menu_render()')]
-    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin']:
+    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks']:
         assert_true(f'module_summary {mod}' in collect_body, f"main status should be driven by module_summary for {mod}")
     assert_true('module_dispatch()' in TEXT, "module dispatcher skeleton missing")
     menu_body = TEXT[TEXT.index('menu()'):TEXT.index('# ==============================================================================', TEXT.index('menu()'))]
@@ -317,9 +317,26 @@ def test_protocol_links_and_udp_port_input_consistency():
 
 
 def test_state_schema_and_plugin_permission_hardening():
-    assert_true('.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888}' in TEXT, "ports schema initialization must include cforigin")
+    assert_true('.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080}' in TEXT, "ports schema initialization must include cforigin and socks")
     assert_true('_plugin_path_safe()' in TEXT and 'stat -c' in TEXT and '_plugin_path_safe "${PLUGIN_DIR}"' in TEXT, "plugin loader must enforce ownership/mode before source")
     assert_true('val_port "${_value}"' in TEXT and 'legacy 端口字段非法' in TEXT, "legacy port migration must validate bad values explicitly")
+
+
+def test_socks5_module_option_and_plugin_contract():
+    assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"' in TEXT, "module registry must include socks")
+    assert_true('socks)    printf \'SOCKS5\'' in TEXT, "SOCKS5 label missing")
+    assert_true('module_summary socks' in TEXT and '_MENU_SD=$(module_summary socks)' in TEXT, "main status must summarize socks")
+    assert_true('socks:menu)     manage_socks' in TEXT, "SOCKS5 menu must route through dispatcher")
+    for token in ['socks:enable)', 'socks:disable)', 'socks:uninstall)', 'socks:update_port)', 'socks:update_listen)', 'socks:update_auth)', 'socks:show)']:
+        assert_true(token in TEXT, f"SOCKS5 dispatch route missing: {token}")
+    for fn in ['ask_socks_mode()', 'manage_socks()', 'module_socks_enable()', 'module_socks_disable()', 'module_socks_uninstall()', 'module_socks_update_port()', 'module_socks_update_listen()', 'module_socks_update_auth()']:
+        assert_true(fn in TEXT, f"SOCKS5 helper missing: {fn}")
+    assert_true('"socks":   1080' in TEXT and '"socks": {' in TEXT, "state schema must include socks port/config")
+    socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
+    for token in ['_plg_socks_inbound()', 'protocol:"socks"', 'auth:"password"', 'accounts:[{user:$user, pass:$pass}]', '_plg_socks_ports()', '_plg_socks_link()']:
+        assert_true(token in socks_plugin, f"SOCKS5 plugin token missing: {token}")
+    assert_true('_menu_update_port socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
 
 
 def main():
