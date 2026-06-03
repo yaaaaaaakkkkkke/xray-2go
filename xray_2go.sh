@@ -1157,13 +1157,12 @@ _plg_socks_inbound() {
 
 _plg_socks_link() {
     _plg_socks_enabled || return 0
-    local _ip _port _user _pass _u _pw
+    local _ip _port _auth
     _ip=$(platform_get_realip)
     [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，SOCKS5 节点已跳过"; return 0; }
     _port=$(port_of socks)
-    _user=$(urlencode_path "$(st_get '.socks.user')")
-    _pass=$(urlencode_path "$(st_get '.socks.pass')")
-    printf 'socks5://%s:%s@%s:%s#SOCKS5\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
+    _auth=$(printf '%s:%s' "$(st_get '.socks.user')" "$(st_get '.socks.pass')" | base64 | tr '+/' '-_' | tr -d '=\n')
+    printf 'socks://%s@%s:%s#SOCKS5\n' "${_auth}" "${_ip}" "${_port}"
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/socks.sh"
@@ -1906,7 +1905,7 @@ config_print_nodes() {
     _links=""
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         local _l; _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        [ -n "${_l:-}" ] && _links="${_links}$(printf '%s\n' "${_l}" | grep -E '^(vless|socks5?)://' || true)"$'\n'
+        [ -n "${_l:-}" ] && _links="${_links}$(printf '%s\n' "${_l}" | grep -E '^(vless|socks)://' || true)"$'\n'
     done
 
     if [ -z "${_links:-}" ]; then
