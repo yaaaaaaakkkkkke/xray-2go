@@ -148,7 +148,7 @@ def test_argo_env_final_token_validation_and_menu_install_state():
 
 
 def test_install_service_and_firewall_fail_closed_status():
-    install_body = TEXT[TEXT.index('exec_install()'):TEXT.index('exec_uninstall()')]
+    install_body = TEXT[TEXT.index('exec_install()'):TEXT.index('module_xray_uninstall()')]
     helper_body = TEXT[TEXT.index('svc_enable_start_verify()'):TEXT.index('# ==============================================================================', TEXT.index('svc_enable_start_verify()'))]
     assert_true('fw_reconcile || { _install_rollback' in install_body, "install must rollback/fail when firewall reconcile fails")
     assert_true('svc_enable_start_verify "${_SVC_XRAY}" 8 required' in install_body, "xray install start path should use shared verified start helper")
@@ -191,7 +191,9 @@ def test_single_file_module_dispatch_actions():
     for fn in ['module_xray_install()', 'module_xray_uninstall()', 'module_nodes_show()', 'module_config_update_uuid()', 'module_config_update_shortcut()', 'module_xray_restart()', 'module_argo_restart()', 'module_show_nodes()', 'module_cforigin_show()']:
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
     xray_install_body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
+    xray_uninstall_body = TEXT[TEXT.index('module_xray_uninstall()'):TEXT.index('\n}\n', TEXT.index('module_xray_uninstall()'))]
     assert_true('_menu_do_install()' not in TEXT and '_menu_do_install' not in xray_install_body, "xray install workflow should live in module_xray_install, not a menu helper wrapper")
+    assert_true('exec_uninstall()' not in TEXT and 'exec_uninstall' not in xray_uninstall_body, "xray uninstall workflow should live in module_xray_uninstall, not a wrapper")
     assert_true('_module_action_or_continue reality restart' in TEXT and '_module_action_or_continue vltcp show' in TEXT, "module menus should route representative actions through shared dispatch wrapper")
 
 

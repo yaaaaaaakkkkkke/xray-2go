@@ -3096,7 +3096,7 @@ exec_install() {
     log_ok "══ 安装完成 ══"
 }
 
-exec_uninstall() {
+module_xray_uninstall() {
     local _a; prompt "确定要卸载 xray2go？(y/N): " _a
     case "${_a:-n}" in y|Y) :;; *) log_info "已取消"; return;; esac
     log_step "卸载中..."
@@ -3481,10 +3481,6 @@ module_config_update_uuid() {
 
 module_config_update_shortcut() {
     exec_update_shortcut
-}
-
-module_xray_uninstall() {
-    exec_uninstall
 }
 
 module_xray_restart() {
