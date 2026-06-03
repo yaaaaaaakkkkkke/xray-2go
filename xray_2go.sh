@@ -3465,6 +3465,32 @@ module_cforigin_show() {
     cforigin_print_cloudflare_hint
 }
 
+module_nodes_show() {
+    if [ "${_MENU_CX:-1}" -eq 0 ] 2>/dev/null || check_xray >/dev/null 2>&1; then
+        config_print_nodes
+        cforigin_print_cloudflare_hint
+        return 0
+    fi
+    log_warn "Xray-2go 未安装或未运行"
+    return 1
+}
+
+module_config_update_uuid() {
+    [ -f "${CONFIG_FILE}" ] && exec_update_uuid || log_warn "请先安装 Xray-2go"
+}
+
+module_config_update_shortcut() {
+    exec_update_shortcut
+}
+
+module_xray_install() {
+    _menu_do_install
+}
+
+module_xray_uninstall() {
+    exec_uninstall
+}
+
 module_xray_restart() {
     svc_restart_xray || true
 }
@@ -3478,6 +3504,11 @@ module_argo_restart() {
 module_dispatch() {
     local _mod="${1:-}" _action="${2:-menu}"
     case "${_mod}:${_action}" in
+        xray:install) module_xray_install ;;
+        xray:uninstall) module_xray_uninstall ;;
+        nodes:show) module_nodes_show ;;
+        config:update_uuid) module_config_update_uuid ;;
+        config:update_shortcut) module_config_update_shortcut ;;
         argo:menu)     manage_argo ;;
         ff:menu)       manage_freeflow ;;
         reality:menu)  manage_reality ;;
@@ -4141,19 +4172,17 @@ menu() {
         _menu_render
         local _c; prompt "请输入选择 (0-10/s): " _c; echo ""
         case "${_c:-}" in
-            1) _menu_do_install ;;
-            2) exec_uninstall ;;
+            1) module_dispatch xray install ;;
+            2) module_dispatch xray uninstall ;;
             3) module_dispatch argo ;;
             4) module_dispatch reality ;;
             5) module_dispatch vltcp ;;
             6) module_dispatch vlquic ;;
             7) module_dispatch ff ;;
             8) module_dispatch cforigin ;;
-            9) [ "${_MENU_CX}" -eq 0 ] && { config_print_nodes; cforigin_print_cloudflare_hint; } \
-                    || log_warn "Xray-2go 未安装或未运行" ;;
-            10) [ -f "${CONFIG_FILE}" ] && exec_update_uuid \
-                    || log_warn "请先安装 Xray-2go" ;;
-            s) exec_update_shortcut ;;
+            9) module_dispatch nodes show ;;
+            10) module_dispatch config update_uuid ;;
+            s) module_dispatch config update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
             *) log_error "无效选项，请输入 0-10 或 s" ;;
         esac
