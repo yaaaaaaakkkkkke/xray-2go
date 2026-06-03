@@ -2077,8 +2077,7 @@ module_cforigin_update_listen() {
     [ -n "${_l:-}" ] || return 0
     _l=$(val_listen_addr "${_l}") || return 1
     st_set '.cforigin.listen = $l' --arg l "${_l}" || return 1
-    [ "${_en}" = "true" ] && { config_apply || return 1; }
-    st_persist || { log_error "state.json 写入失败"; return 1; }
+    _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "监听地址已更新: ${_l}"
 }
 
