@@ -276,13 +276,22 @@ port_mgr_in_use_udp() {
 }
 
 port_mgr_random() {
+    port_mgr_random_proto tcp
+}
+
+port_mgr_random_proto() {
+    local _proto="${1:-tcp}"
     local _i=0 _p
+    case "${_proto}" in tcp|udp) : ;; *) log_error "未知端口协议: ${_proto}"; return 1 ;; esac
     while true; do
         _p=$(shuf -i 10000-60000 -n 1 2>/dev/null \
              || awk 'BEGIN{srand();print int(rand()*50000)+10000}')
         _i=$(( _i + 1 ))
-        port_mgr_in_use "${_p}" || { printf '%s' "${_p}"; return 0; }
-        [ "${_i}" -gt 30 ] && { log_error "无法找到空闲端口"; return 1; }
+        case "${_proto}" in
+            udp) port_mgr_in_use_udp "${_p}" || { printf '%s' "${_p}"; return 0; } ;;
+            tcp) port_mgr_in_use     "${_p}" || { printf '%s' "${_p}"; return 0; } ;;
+        esac
+        [ "${_i}" -gt 30 ] && { log_error "无法找到空闲 ${_proto^^} 端口"; return 1; }
     done
 }
 
@@ -3532,8 +3541,7 @@ module_dispatch() {
 _menu_input_port_proto() {
     local _jq_path="$1" _proto="${2:-tcp}" _outvar="${3:-}" _port_input
     prompt "新端口（回车随机）: " _port_input
-    [ -z "${_port_input:-}" ] && _port_input=$(shuf -i 1024-65000 -n 1 2>/dev/null || \
-                              awk 'BEGIN{srand();print int(rand()*63976)+1024}')
+    [ -z "${_port_input:-}" ] && _port_input=$(port_mgr_random_proto "${_proto}")
     # 统一通过 val_port 校验，防止配置注入
     val_port "${_port_input}" >/dev/null || return 1
     case "${_proto}" in

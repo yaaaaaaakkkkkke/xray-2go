@@ -280,6 +280,19 @@ def test_protocol_links_and_udp_port_input_consistency():
     vlquic = TEXT[TEXT.index('_plg_vlquic_link()'):TEXT.index('PLUGIN_EOF', TEXT.index('_plg_vlquic_link()'))]
     assert_true('extra=%%7B%%22xhttpModeH3%%22%%3Atrue%%7D' in vlquic, "VLESS-XHTTP-H3 link should encode xhttpModeH3 in XHTTP extra")
     assert_true('_menu_update_port()' in TEXT, "menu port updates should use shared helper")
+    assert_true('port_mgr_random_proto()' in TEXT, "random port selection should be protocol-aware")
+    assert_true('_port_input=$(port_mgr_random_proto "${_proto}")' in TEXT, "empty port input should use protocol-aware random selection")
+    out = run_bash("""
+        source ./xray_2go.sh
+        _seq=$(mktemp)
+        printf '0' > "${_seq}"
+        shuf() { local n; n=$(cat "${_seq}"); n=$((n + 1)); printf '%s' "${n}" > "${_seq}"; [ "${n}" -eq 1 ] && printf '443\\n' || printf '444\\n'; }
+        port_mgr_in_use() { return 1; }
+        port_mgr_in_use_udp() { [ "$1" = 443 ]; }
+        printf 'tcp=%s udp=%s' "$(port_mgr_random_proto tcp)" "$(port_mgr_random_proto udp)"
+        rm -f "${_seq}"
+    """)
+    assert_true(out.strip() == 'tcp=443 udp=444', "random port selection must check TCP/UDP independently")
     assert_true('_menu_update_port vlquic udp udp' in TEXT, "VLQUIC management port input must preserve UDP conflict checks")
 
 
