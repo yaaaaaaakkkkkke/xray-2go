@@ -3026,7 +3026,7 @@ _install_rollback() {
     lifecycle_rollback_hosts
 }
 
-exec_install() {
+module_xray_install_core() {
     clear; log_title "══════════ 安装 Xray-2go ══════════"
     platform_preflight
     mkdir -p "${WORK_DIR}" && chmod 750 "${WORK_DIR}"
@@ -4131,7 +4131,7 @@ module_xray_install() {
             log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
     fi
 
-    if ! exec_install; then
+    if ! module_xray_install_core; then
         log_error "安装失败"; _pause; return
     fi
 

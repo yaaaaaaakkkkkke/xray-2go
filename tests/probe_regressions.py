@@ -148,7 +148,7 @@ def test_argo_env_final_token_validation_and_menu_install_state():
 
 
 def test_install_service_and_firewall_fail_closed_status():
-    install_body = TEXT[TEXT.index('exec_install()'):TEXT.index('module_xray_uninstall()')]
+    install_body = TEXT[TEXT.index('module_xray_install_core()'):TEXT.index('module_xray_uninstall()')]
     helper_body = TEXT[TEXT.index('svc_enable_start_verify()'):TEXT.index('# ==============================================================================', TEXT.index('svc_enable_start_verify()'))]
     assert_true('fw_reconcile || { _install_rollback' in install_body, "install must rollback/fail when firewall reconcile fails")
     assert_true('svc_enable_start_verify "${_SVC_XRAY}" 8 required' in install_body, "xray install start path should use shared verified start helper")
@@ -194,6 +194,8 @@ def test_single_file_module_dispatch_actions():
     xray_uninstall_body = TEXT[TEXT.index('module_xray_uninstall()'):TEXT.index('\n}\n', TEXT.index('module_xray_uninstall()'))]
     config_uuid_body = TEXT[TEXT.index('module_config_update_uuid()'):TEXT.index('\n}\n', TEXT.index('module_config_update_uuid()'))]
     config_shortcut_body = TEXT[TEXT.index('module_config_update_shortcut()'):TEXT.index('\n}\n', TEXT.index('module_config_update_shortcut()'))]
+    assert_true('exec_install()' not in TEXT and 'exec_install' not in xray_install_body, "xray install should call module_xray_install_core, not exec_install")
+    assert_true('module_xray_install_core()' in TEXT and 'module_xray_install_core' in xray_install_body, "xray install core helper missing or unused")
     assert_true('_menu_do_install()' not in TEXT and '_menu_do_install' not in xray_install_body, "xray install workflow should live in module_xray_install, not a menu helper wrapper")
     assert_true('exec_uninstall()' not in TEXT and 'exec_uninstall' not in xray_uninstall_body, "xray uninstall workflow should live in module_xray_uninstall, not a wrapper")
     assert_true('exec_update_uuid()' not in TEXT and 'exec_update_uuid' not in config_uuid_body, "config UUID workflow should live in module_config_update_uuid, not a wrapper")
