@@ -126,7 +126,7 @@ def test_config_detects_wildcard_listen_conflicts_and_filters_links():
     assert_true('_used_wild_ports' in TEXT and '_used_exact_keys' in TEXT, "config build must track wildcard ports and exact listen keys separately")
     assert_true('printf \'%s\\n\' "${_used_wild_ports}" | grep -qxF "${_p}"' in TEXT, "specific listen must conflict with existing wildcard same-port listener")
     assert_true('printf \'%s\\n\' "${_used_exact_keys}" | grep -qE ":${_p}$"' in TEXT, "wildcard listen must conflict with existing specific same-port listener")
-    assert_true("^vless://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and only print vless links")
+    assert_true("^(vless|socks5?)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
 
 
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
@@ -337,6 +337,13 @@ def test_socks5_module_option_and_plugin_contract():
     for token in ['_plg_socks_inbound()', 'protocol:"socks"', 'auth:"password"', 'accounts:[{user:$user, pass:$pass}]', '_plg_socks_ports()', '_plg_socks_link()']:
         assert_true(token in socks_plugin, f"SOCKS5 plugin token missing: {token}")
     assert_true('_menu_update_port socks tcp' in TEXT, "SOCKS5 port update must use TCP conflict checks")
+
+
+def test_socks5_link_is_generated_and_displayed():
+    assert_true("grep -E '^(vless|socks5?)://'" in TEXT, "node output must include SOCKS/SOCKS5 links, not only vless links")
+    socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
+    assert_true("socks5://%s:%s@%s:%s#SOCKS5" in socks_plugin, "SOCKS5 plugin should generate a socks5:// userinfo link")
+    assert_true('protocol:"socks"' in socks_plugin and 'auth:"password"' in socks_plugin, "SOCKS5 inbound should follow reference socks password-auth implementation")
 
 
 def main():

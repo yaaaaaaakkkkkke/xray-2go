@@ -1163,7 +1163,7 @@ _plg_socks_link() {
     _port=$(port_of socks)
     _user=$(urlencode_path "$(st_get '.socks.user')")
     _pass=$(urlencode_path "$(st_get '.socks.pass')")
-    printf 'socks://%s:%s@%s:%s#SOCKS5\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
+    printf 'socks5://%s:%s@%s:%s#SOCKS5\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/socks.sh"
@@ -1906,7 +1906,7 @@ config_print_nodes() {
     _links=""
     for _name in "${_PLUGIN_REGISTRY[@]}"; do
         local _l; _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        [ -n "${_l:-}" ] && _links="${_links}$(printf '%s\n' "${_l}" | grep -E '^vless://' || true)"$'\n'
+        [ -n "${_l:-}" ] && _links="${_links}$(printf '%s\n' "${_l}" | grep -E '^(vless|socks5?)://' || true)"$'\n'
     done
 
     if [ -z "${_links:-}" ]; then
