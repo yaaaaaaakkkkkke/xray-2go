@@ -4,7 +4,9 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
 
 ## 功能特性
 
-- 交互式安装和管理菜单
+- 默认无参数运行进入交互式自定义选项搭建菜单
+- 支持 `reality` 非交互一键安装（默认参数 + 443 冲突自动随机端口）
+- 交互式安装后管理菜单
 - 支持 systemd 与 OpenRC
 - 支持 Debian / Ubuntu / RHEL 系 / Alpine
 - 内置协议：
@@ -40,13 +42,23 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
 
 ## 快速使用
 
-### 一键运行交互菜单
+### 运行交互式自定义选项搭建菜单
 
 请在 root 用户下执行；如果当前不是 root，请先切换到 root，或使用下面的“下载后运行”方式配合 `sudo`。
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh)
 ```
+
+### 非交互一键安装：Reality
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) reality
+```
+
+说明：
+- 仅 `reality` 会直接触发非交互安装
+- 默认优先尝试 `443`，若 `443` 已被占用，则自动切换到随机高位 TCP 端口
 
 ### 下载后运行
 

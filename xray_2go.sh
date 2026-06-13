@@ -4324,6 +4324,303 @@ _menu_render() {
     printf "  ${C_RED}0.${C_RST} 退出\n\n"
 }
 
+install_plan_reset_defaults() {
+    local _uuid
+    _uuid=$(st_get '.uuid')
+    _G_STATE="${_STATE_DEFAULT}"
+    _st_normalize_schema
+    if [ -n "${_uuid:-}" ] && val_uuid "${_uuid}" >/dev/null 2>&1; then
+        st_set '.uuid = $u' --arg u "${_uuid}" || return 1
+    else
+        st_set '.uuid = $u' --arg u "$(crypto_gen_uuid)" || return 1
+    fi
+    st_set '
+        .argo.enabled = false |
+        .argo.protocol = "ws" |
+        .argo.mode = "fixed" |
+        .argo.domain = null |
+        .argo.token = null |
+        .ff.enabled = false |
+        .ff.protocol = "none" |
+        .ff.path = "/" |
+        .ff.host = "" |
+        .reality.enabled = false |
+        .reality.sni = "addons.mozilla.org" |
+        .reality.network = "tcp" |
+        .reality.pbk = null |
+        .reality.pvk = null |
+        .reality.sid = null |
+        .vltcp.enabled = false |
+        .vltcp.listen = "0.0.0.0" |
+        .socks.enabled = false |
+        .socks.listen = "0.0.0.0" |
+        .socks.user = "xray2go" |
+        .socks.pass = "xray2go" |
+        .vlquic.enabled = false |
+        .vlquic.listen = "0.0.0.0" |
+        .vlquic.domain = "" |
+        .vlquic.cert = "" |
+        .vlquic.key = "" |
+        .vlquic.acme_method = "manual" |
+        .cforigin.enabled = false |
+        .cforigin.domain = "" |
+        .cforigin.protocol = "ws" |
+        .cforigin.path = "/origin" |
+        .cforigin.listen = "::" |
+        .cforigin.edge_port = 443 |
+        .cforigin.edge_h3 = false |
+        .cforigin.origin_tls = true |
+        .cforigin.cert = "" |
+        .cforigin.key = "" |
+        .cforigin.acme_method = "manual" |
+        .xpad.argo = true |
+        .xpad.ff = true |
+        .xpad.reality = true
+    ' || return 1
+}
+
+reality_pick_default_tcp_port() {
+    local _preferred=443 _fallback
+    if port_mgr_in_use "${_preferred}"; then
+        _fallback=$(port_mgr_random_proto tcp) || return 1
+        log_warn "TCP/${_preferred} 已被占用，Reality 预设自动改用随机端口: ${_fallback}"
+        printf '%s' "${_fallback}"
+        return 0
+    fi
+    printf '%s' "${_preferred}"
+}
+
+preset_apply_reality_tcp_default() {
+    local _port
+    install_plan_reset_defaults || return 1
+    _port=$(reality_pick_default_tcp_port) || return 1
+    st_set '
+        .reality.enabled = true |
+        .reality.network = "tcp" |
+        .reality.sni = "addons.mozilla.org" |
+        .ports.reality = ($p|tonumber) |
+        .argo.enabled = false |
+        .ff.enabled = false |
+        .ff.protocol = "none" |
+        .vltcp.enabled = false |
+        .socks.enabled = false |
+        .vlquic.enabled = false |
+        .cforigin.enabled = false
+    ' --arg p "${_port}" || return 1
+    log_info "已应用预设: VLESS + Reality (TCP, port=${_port})"
+}
+
+install_plan_has_enabled_module() {
+    [ "$(st_get '.argo.enabled')" = "true" ] && return 0
+    [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" != "none" ] && return 0
+    [ "$(st_get '.reality.enabled')" = "true" ] && return 0
+    [ "$(st_get '.vltcp.enabled')" = "true" ] && return 0
+    [ "$(st_get '.socks.enabled')" = "true" ] && return 0
+    [ "$(st_get '.vlquic.enabled')" = "true" ] && return 0
+    [ "$(st_get '.cforigin.enabled')" = "true" ] && return 0
+    return 1
+}
+
+install_plan_module_summary() {
+    local _mod="$1"
+    case "${_mod}" in
+        argo)
+            [ "$(st_get '.argo.enabled')" = "true" ]                 && printf '%s' "已启用 ($(st_get '.argo.protocol'), port=$(port_of argo), domain=$(st_get '.argo.domain'))"                 || printf '未启用' ;;
+        ff)
+            if [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" != "none" ]; then
+                if [ "$(st_get '.ff.protocol')" = "tcphttp" ]; then
+                    printf '%s' "已启用 (tcphttp, host=$(st_get '.ff.host'), port=$(port_of ff))"
+                else
+                    printf '%s' "已启用 ($(st_get '.ff.protocol'), path=$(st_get '.ff.path'), port=$(port_of ff))"
+                fi
+            else
+                printf '未启用'
+            fi ;;
+        reality)
+            [ "$(st_get '.reality.enabled')" = "true" ]                 && printf '%s' "已启用 ($(st_get '.reality.network'), port=$(port_of reality), sni=$(st_get '.reality.sni'))"                 || printf '未启用' ;;
+        vltcp)
+            [ "$(st_get '.vltcp.enabled')" = "true" ]                 && printf '%s' "已启用 (port=$(port_of vltcp), listen=$(st_get '.vltcp.listen'))"                 || printf '未启用' ;;
+        socks)
+            [ "$(st_get '.socks.enabled')" = "true" ]                 && printf '%s' "已启用 (port=$(port_of socks), listen=$(st_get '.socks.listen'), user=$(st_get '.socks.user'))"                 || printf '未启用' ;;
+        vlquic)
+            [ "$(st_get '.vlquic.enabled')" = "true" ]                 && printf '%s' "已启用 (udp=$(port_of vlquic), domain=$(st_get '.vlquic.domain'))"                 || printf '未启用' ;;
+        cforigin)
+            [ "$(st_get '.cforigin.enabled')" = "true" ]                 && printf '%s' "已启用 ($(st_get '.cforigin.protocol'), edge=$(st_get '.cforigin.edge_port'), origin=$(port_of cforigin), domain=$(st_get '.cforigin.domain'))"                 || printf '未启用' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+install_plan_render_summary() {
+    clear; echo ""
+    log_title "══ 安装计划（默认自定义选项搭建） ══"
+    printf "  UUID     : ${C_CYN}%s${C_RST}\n" "$(st_get '.uuid')"
+    printf "  Argo     : %s\n" "$(install_plan_module_summary argo)"
+    printf "  FreeFlow : %s\n" "$(install_plan_module_summary ff)"
+    printf "  Reality  : %s\n" "$(install_plan_module_summary reality)"
+    printf "  VLESS-TCP: %s\n" "$(install_plan_module_summary vltcp)"
+    printf "  SOCKS5   : %s\n" "$(install_plan_module_summary socks)"
+    printf "  XHTTP-H3 : %s\n" "$(install_plan_module_summary vlquic)"
+    printf "  CF-Origin: %s\n" "$(install_plan_module_summary cforigin)"
+    _hr
+    _menu_print_action 1 "配置 Argo"
+    _menu_print_action 2 "配置 FreeFlow"
+    _menu_print_action 3 "配置 Reality"
+    _menu_print_action 4 "配置 VLESS-TCP"
+    _menu_print_action 5 "配置 SOCKS5"
+    _menu_print_action 6 "配置 VLESS-XHTTP-H3"
+    _menu_print_action 7 "配置 CF Origin"
+    _menu_print_action 8 "修改 UUID"
+    _menu_print_action 9 "重置当前安装计划" "${C_YLW}"
+    _menu_print_action 10 "校验当前安装计划"
+    _menu_print_action 11 "执行安装" "${C_GRN}"
+    _menu_print_back
+    _hr
+}
+
+install_plan_configure_argo() {
+    ask_argo_mode || return 1
+    if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        ask_argo_protocol || return 1
+        if [ "$(st_get '.argo.protocol')" = "xhttp" ]; then
+            ask_xpad_mode argo Argo || return 1
+        fi
+    fi
+}
+
+install_plan_configure_freeflow() {
+    ask_freeflow_mode || return 1
+    if [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" = "xhttp" ]; then
+        ask_xpad_mode ff FreeFlow || return 1
+    fi
+}
+
+install_plan_configure_reality() {
+    ask_reality_mode || return 1
+    if [ "$(st_get '.reality.enabled')" = "true" ] && [ "$(st_get '.reality.network')" = "xhttp" ]; then
+        ask_xpad_mode reality Reality || return 1
+    fi
+}
+
+install_plan_configure_uuid() {
+    local _v
+    prompt "新 UUID（回车自动生成）: " _v
+    if [ -z "${_v:-}" ]; then
+        _v=$(crypto_gen_uuid) || { log_error "UUID 生成失败"; return 1; }
+        log_info "已生成 UUID: ${_v}"
+    fi
+    val_uuid "${_v}" >/dev/null || return 1
+    st_set '.uuid = $u' --arg u "${_v}" || return 1
+    log_ok "安装计划 UUID 已更新: ${_v}"
+}
+
+install_plan_validate() {
+    install_plan_has_enabled_module || { log_error "安装计划无效：至少启用一个入站模块"; return 1; }
+
+    if [ "$(st_get '.argo.enabled')" = "true" ]; then
+        case "$(st_get '.argo.protocol')" in ws|xhttp) : ;; *) log_error "Argo 协议非法"; return 1 ;; esac
+        val_port "$(port_of argo)" >/dev/null || return 1
+    fi
+
+    if [ "$(st_get '.ff.enabled')" = "true" ]; then
+        case "$(st_get '.ff.protocol')" in ws|httpupgrade|xhttp|tcphttp) : ;; *) log_error "FreeFlow 协议非法"; return 1 ;; esac
+        val_port "$(port_of ff)" >/dev/null || return 1
+        if [ "$(st_get '.ff.protocol')" = "tcphttp" ]; then
+            [ -n "$(st_get '.ff.host')" ] || { log_error "FreeFlow Host 不能为空"; return 1; }
+        else
+            val_path "$(st_get '.ff.path')" >/dev/null || return 1
+        fi
+    fi
+
+    if [ "$(st_get '.reality.enabled')" = "true" ]; then
+        case "$(st_get '.reality.network')" in tcp|xhttp) : ;; *) log_error "Reality 传输方式非法"; return 1 ;; esac
+        val_port "$(port_of reality)" >/dev/null || return 1
+        val_domain "$(st_get '.reality.sni')" >/dev/null || return 1
+    fi
+
+    if [ "$(st_get '.vltcp.enabled')" = "true" ]; then
+        val_port "$(port_of vltcp)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.vltcp.listen')" >/dev/null || return 1
+    fi
+
+    if [ "$(st_get '.socks.enabled')" = "true" ]; then
+        val_port "$(port_of socks)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.socks.listen')" >/dev/null || return 1
+        [ -n "$(st_get '.socks.user')" ] || { log_error "SOCKS5 用户名不能为空"; return 1; }
+    fi
+
+    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
+        val_port "$(port_of vlquic)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.vlquic.listen')" >/dev/null || return 1
+        [ -n "$(st_get '.vlquic.domain')" ] || { log_error "VLESS-XHTTP-H3 域名不能为空"; return 1; }
+        [ -f "$(st_get '.vlquic.cert')" ] || { log_error "VLESS-XHTTP-H3 证书文件不存在"; return 1; }
+        [ -f "$(st_get '.vlquic.key')" ] || { log_error "VLESS-XHTTP-H3 私钥文件不存在"; return 1; }
+    fi
+
+    if [ "$(st_get '.cforigin.enabled')" = "true" ]; then
+        case "$(st_get '.cforigin.protocol')" in ws|httpupgrade|xhttp) : ;; *) log_error "CF Origin 协议非法"; return 1 ;; esac
+        val_path "$(st_get '.cforigin.path')" >/dev/null || return 1
+        cf_edge_port_valid "$(st_get '.cforigin.edge_port')" || return 1
+        val_port "$(port_of cforigin)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.cforigin.listen')" >/dev/null || return 1
+        [ -n "$(st_get '.cforigin.domain')" ] || { log_error "CF Origin 域名不能为空"; return 1; }
+        [ -f "$(st_get '.cforigin.cert')" ] || { log_error "CF Origin 证书文件不存在"; return 1; }
+        [ -f "$(st_get '.cforigin.key')" ] || { log_error "CF Origin 私钥文件不存在"; return 1; }
+    fi
+
+    log_ok "安装计划校验通过"
+}
+
+install_execute_current_plan() {
+    install_plan_validate || return 1
+
+    if [ "$(st_get '.reality.enabled')" = "true" ] && [ "$(st_get '.argo.enabled')" = "true" ]; then
+        [ "$(port_of reality)" = "$(port_of argo)" ] &&             log_warn "Reality 端口与 Argo 回源端口相同；当前不会自动更换，请返回修改端口，否则安装阶段会失败"
+    fi
+    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
+        port_mgr_in_use_udp "$(port_of vlquic)" &&             log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
+    fi
+
+    if ! module_xray_install_core; then
+        log_error "安装失败"
+        return 1
+    fi
+
+    st_persist || { log_error "state.json 写入失败"; return 1; }
+
+    [ "$(st_get '.argo.enabled')" = "true" ] &&         { argo_apply_fixed_tunnel ||           log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"; }
+    config_print_nodes
+    cforigin_print_cloudflare_hint
+}
+
+install_plan_menu() {
+    while true; do
+        install_plan_render_summary
+        local _c
+        prompt "请输入选择 (0-11): " _c
+        echo ""
+        case "${_c:-}" in
+            1) install_plan_configure_argo || true ;;
+            2) install_plan_configure_freeflow || true ;;
+            3) install_plan_configure_reality || true ;;
+            4) ask_vltcp_mode || true ;;
+            5) ask_socks_mode || true ;;
+            6) ask_vlquic_mode || true ;;
+            7) ask_cforigin_mode || true ;;
+            8) install_plan_configure_uuid || true ;;
+            9) install_plan_reset_defaults || true; log_info "安装计划已重置为自定义搭建初始状态" ;;
+            10) install_plan_validate || true ;;
+            11)
+                install_execute_current_plan && return 0
+                ;;
+            0)
+                log_info "已取消安装"
+                return 0 ;;
+            *) log_error "无效选项，请输入 0-11" ;;
+        esac
+        _pause
+    done
+}
+
 module_xray_install() {
     if [ "${_MENU_XI}" -eq 1 ]; then
         if [ "${_MENU_CX}" -eq 0 ]; then
@@ -4331,48 +4628,9 @@ module_xray_install() {
         fi
         log_warn "Xray-2go 已安装但未运行；如需重装请先卸载 (选项 2)，如需启动请进入对应管理菜单。"; return
     fi
-
-    ask_argo_mode
-    [ "$(st_get '.argo.enabled')" = "true" ] && ask_argo_protocol
-    ask_freeflow_mode
-    ask_reality_mode
-    ask_vltcp_mode
-    ask_socks_mode
-    ask_vlquic_mode
-    ask_cforigin_mode
-
-    if [ "$(st_get '.argo.enabled')" = "true" ] && [ "$(st_get '.argo.protocol')" = "xhttp" ]; then
-        ask_xpad_mode argo Argo
-    fi
-    if [ "$(st_get '.ff.enabled')" = "true" ] && [ "$(st_get '.ff.protocol')" = "xhttp" ]; then
-        ask_xpad_mode ff FreeFlow
-    fi
-    if [ "$(st_get '.reality.enabled')" = "true" ] && [ "$(st_get '.reality.network')" = "xhttp" ]; then
-        ask_xpad_mode reality Reality
-    fi
-
-    if [ "$(st_get '.reality.enabled')" = "true" ]; then
-        [ "$(port_of reality)" = "$(port_of argo)" ] && \
-            log_warn "Reality 端口与 Argo 回源端口相同；当前不会自动更换，请返回修改端口，否则安装阶段会失败"
-    fi
-    if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
-        port_mgr_in_use_udp "$(port_of vlquic)" && \
-            log_warn "VLESS-XHTTP-H3 UDP/$(port_of vlquic) 已被占用"
-    fi
-
-    if ! module_xray_install_core; then
-        log_error "安装失败"; _pause; return
-    fi
-
-    st_persist || { log_error "state.json 写入失败"; return 1; }
-
-    [ "$(st_get '.argo.enabled')" = "true" ] && \
-        { argo_apply_fixed_tunnel || \
-          log_error "固定隧道配置失败，请从 [3. Argo 管理] 重新配置"; }
-    config_print_nodes
-    cforigin_print_cloudflare_hint
+    install_plan_reset_defaults || { log_error "安装计划初始化失败"; return 1; }
+    install_plan_menu
 }
-
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
     local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD=""
@@ -4400,6 +4658,54 @@ menu() {
     done
 }
 
+usage() {
+    cat <<'EOF'
+用法:
+  xray2go                 进入交互菜单
+  xray2go reality
+  xray_2go.sh reality
+
+说明:
+  - 无参数: 默认进入交互式自定义选项搭建菜单
+  - reality: 非交互一键安装 VLESS + Reality (TCP)
+EOF
+}
+
+parse_args() {
+    _CLI_ACTION="menu"
+
+    [ "$#" -eq 0 ] && return 0
+
+    case "$1" in
+        reality)
+            _CLI_ACTION="install"
+            shift ;;
+        -h|--help|help)
+            _CLI_ACTION="help"
+            return 0 ;;
+        *)
+            log_error "未知命令: $1"
+            return 1 ;;
+    esac
+
+    [ "$#" -eq 0 ] || { log_error "未知参数: $1"; return 1; }
+}
+
+cli_install() {
+    preset_apply_reality_tcp_default || return 1
+    install_execute_current_plan
+}
+
+cli_dispatch() {
+    parse_args "$@" || { usage; return 1; }
+    case "${_CLI_ACTION:-menu}" in
+        menu) menu ;;
+        help) usage ;;
+        install) cli_install ;;
+        *) log_error "未知 CLI 动作: ${_CLI_ACTION:-}"; return 1 ;;
+    esac
+}
+
 # ==============================================================================
 # Entrypoint
 # ==============================================================================
@@ -4412,7 +4718,7 @@ main() {
     plugin_install_builtins
     # 加载插件到注册表
     plugin_load_all
-    menu
+    cli_dispatch "$@"
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"

@@ -197,7 +197,8 @@ def test_single_file_module_dispatch_actions():
     config_uuid_body = TEXT[TEXT.index('module_config_update_uuid()'):TEXT.index('\n}\n', TEXT.index('module_config_update_uuid()'))]
     config_shortcut_body = TEXT[TEXT.index('module_config_update_shortcut()'):TEXT.index('\n}\n', TEXT.index('module_config_update_shortcut()'))]
     assert_true('exec_install()' not in TEXT and 'exec_install' not in xray_install_body, "xray install should call module_xray_install_core, not exec_install")
-    assert_true('module_xray_install_core()' in TEXT and 'module_xray_install_core' in xray_install_body, "xray install core helper missing or unused")
+    assert_true('module_xray_install_core()' in TEXT and 'install_plan_menu' in xray_install_body, "xray install should route through the install plan menu and ultimately reuse the shared install core")
+    assert_true('install_execute_current_plan()' in TEXT and 'module_xray_install_core' in TEXT[TEXT.index('install_execute_current_plan()'):TEXT.index('\n}\n', TEXT.index('install_execute_current_plan()'))], "install plan executor should reuse module_xray_install_core")
     assert_true('_menu_do_install()' not in TEXT and '_menu_do_install' not in xray_install_body, "xray install workflow should live in module_xray_install, not a menu helper wrapper")
     assert_true('exec_uninstall()' not in TEXT and 'exec_uninstall' not in xray_uninstall_body, "xray uninstall workflow should live in module_xray_uninstall, not a wrapper")
     assert_true('exec_update_uuid()' not in TEXT and 'exec_update_uuid' not in config_uuid_body, "config UUID workflow should live in module_config_update_uuid, not a wrapper")
@@ -353,6 +354,67 @@ def test_socks5_link_is_generated_and_displayed():
     assert_true("socks://%s@%s:%s#SOCKS5" in socks_plugin, "SOCKS plugin should generate v2rayN-compatible socks:// base64(user:pass) links")
     assert_true("base64" in socks_plugin and "tr -d '=\\n'" in socks_plugin, "SOCKS credentials must be URL-safe base64(user:pass) without padding")
     assert_true('protocol:"socks"' in socks_plugin and 'auth:"password"' in socks_plugin, "SOCKS inbound should follow reference socks password-auth implementation")
+
+
+def test_install_plan_menu_becomes_default_install_entry():
+    assert_true('install_plan_reset_defaults()' in TEXT, "install plan reset helper missing")
+    assert_true('install_plan_render_summary()' in TEXT, "install plan summary renderer missing")
+    assert_true('install_plan_validate()' in TEXT, "install plan validator missing")
+    assert_true('install_execute_current_plan()' in TEXT, "shared install executor missing")
+    assert_true('install_plan_menu()' in TEXT, "install plan menu missing")
+    body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
+    for token in ['install_plan_reset_defaults', 'install_plan_menu']:
+        assert_true(token in body, f"module_xray_install should route through {token}")
+    for forbidden in ['ask_argo_mode', 'ask_freeflow_mode', 'ask_reality_mode', 'ask_vltcp_mode', 'ask_socks_mode', 'ask_vlquic_mode', 'ask_cforigin_mode']:
+        assert_true(forbidden not in body, f"default install entry should not directly chain {forbidden}")
+    plan_menu = TEXT[TEXT.index('install_plan_menu()'):TEXT.index('\n}\n', TEXT.index('install_plan_menu()'))]
+    for marker in ['1) install_plan_configure_argo', '2) install_plan_configure_freeflow', '3) install_plan_configure_reality', '4) ask_vltcp_mode', '5) ask_socks_mode', '6) ask_vlquic_mode', '7) ask_cforigin_mode', '10) install_plan_validate', '11)', 'install_execute_current_plan && return 0']:
+        assert_true(marker in plan_menu, f"install plan menu route missing: {marker}")
+
+
+def test_cli_reality_tcp_preset_entry_exists_and_uses_shared_executor():
+    for fn in ['usage()', 'parse_args()', 'cli_install()', 'cli_dispatch()', 'preset_apply_reality_tcp_default()', 'reality_pick_default_tcp_port()']:
+        assert_true(fn in TEXT, f"CLI helper missing: {fn}")
+    parse_body = TEXT[TEXT.index('parse_args()'):TEXT.index('\n}\n', TEXT.index('parse_args()'))]
+    for token in ['_CLI_ACTION="menu"', '[ "$#" -eq 0 ] && return 0', 'reality)', '未知参数: $1']:
+        assert_true(token in parse_body, f"parse_args token missing: {token}")
+    cli_install_body = TEXT[TEXT.index('cli_install()'):TEXT.index('\n}\n', TEXT.index('cli_install()'))]
+    for token in ['preset_apply_reality_tcp_default', 'install_execute_current_plan']:
+        assert_true(token in cli_install_body, f"cli_install token missing: {token}")
+    preset_body = TEXT[TEXT.index('preset_apply_reality_tcp_default()'):TEXT.index('\n}\n', TEXT.index('preset_apply_reality_tcp_default()'))]
+    for token in ['.reality.enabled = true', '.reality.network = "tcp"', '.argo.enabled = false', '.ff.enabled = false', '.vltcp.enabled = false', '.socks.enabled = false', '.vlquic.enabled = false', '.cforigin.enabled = false']:
+        assert_true(token in preset_body, f"reality tcp preset missing: {token}")
+    assert_true('reality_pick_default_tcp_port' in preset_body and '.ports.reality = ($p|tonumber)' in preset_body, "reality preset should set port through auto-selection helper")
+    pick_body = TEXT[TEXT.index('reality_pick_default_tcp_port()'):TEXT.index('\n}\n', TEXT.index('reality_pick_default_tcp_port()'))]
+    for token in ['local _preferred=443', 'port_mgr_in_use "${_preferred}"', 'port_mgr_random_proto tcp', '自动改用随机端口']:
+        assert_true(token in pick_body, f"reality default port helper token missing: {token}")
+    main_body = TEXT[TEXT.index('main()'):TEXT.index('if [ "${BASH_SOURCE[0]}" = "$0" ]; then', TEXT.index('main()'))]
+    assert_true('cli_dispatch "$@"' in main_body, "main should route through cli_dispatch")
+    out = run_bash("""
+        source ./xray_2go.sh
+        st_init
+        parse_args reality
+        printf 'alias_action=%s\n' "${_CLI_ACTION}"
+        preset_apply_reality_tcp_default
+        printf 'argo=%s reality=%s net=%s ff=%s socks=%s vlquic=%s cforigin=%s port=%s\n' \
+            "$(st_get '.argo.enabled')" "$(st_get '.reality.enabled')" "$(st_get '.reality.network')" \
+            "$(st_get '.ff.enabled')" "$(st_get '.socks.enabled')" "$(st_get '.vlquic.enabled')" \
+            "$(st_get '.cforigin.enabled')" "$(port_of reality)"
+    """)
+    assert_true('alias_action=install' in out, "reality should enter install mode")
+    assert_true('reality=true net=tcp' in out and 'port=443' in out, "reality tcp preset should apply the expected default state")
+
+
+def test_reality_preset_auto_random_port_when_443_busy():
+    out = run_bash("""
+        source ./xray_2go.sh
+        st_init
+        port_mgr_in_use() { [ "$1" = 443 ]; }
+        port_mgr_random_proto() { printf '23456'; }
+        preset_apply_reality_tcp_default
+        printf 'port=%s\n' "$(port_of reality)"
+    """)
+    assert_true('port=23456' in out, "reality preset should auto-switch to random high port when 443 is busy")
 
 
 def main():
