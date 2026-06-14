@@ -76,6 +76,18 @@ def test_secret_prompt_exists():
         assert_true(f'prompt "{label}' not in TEXT, f"sensitive prompt should not echo: {label}")
 
 
+def test_home_fallback_is_initialized_for_process_substitution_runs():
+    assert_true('if [ -z "${HOME:-}" ]; then' in TEXT and 'export HOME="${_DETECTED_HOME}"' in TEXT, 'script should initialize HOME fallback before later HOME-dependent logic')
+    out = run_bash("""
+        unset HOME
+        source ./xray_2go.sh
+        printf 'home=%s\\n' "${HOME}"
+        lifecycle_cleanup_cloudflared
+        printf 'cleanup-ok\\n'
+    """)
+    assert_true('home=' in out and 'cleanup-ok' in out, 'script should survive unset HOME and cloudflared cleanup path')
+
+
 def test_backup_retention_two():
     assert_true('atomic_write_secret_with_backup "${STATE_FILE}" "${_json}" 2' in TEXT, "state backup retention should be 2")
     assert_true('atomic_write_with_backup "${CONFIG_FILE}" "${_json}" 2' in TEXT, "config backup retention should be 2")
