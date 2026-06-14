@@ -398,15 +398,15 @@ def test_cli_reality_tcp_preset_entry_exists_and_uses_shared_executor():
     for fn in ['usage()', 'parse_args()', 'cli_install()', 'cli_dispatch()', 'preset_apply_reality_tcp_default()', 'reality_pick_default_tcp_port()']:
         assert_true(fn in TEXT, f"CLI helper missing: {fn}")
     parse_body = TEXT[TEXT.index('parse_args()'):TEXT.index('\n}\n', TEXT.index('parse_args()'))]
-    for token in ['_CLI_ACTION="menu"', '[ "$#" -eq 0 ] && return 0', 'reality)', '未知参数: $1']:
+    for token in ['_CLI_ACTION="menu"', '_CLI_REALITY_PORT=""', '[ "$#" -eq 0 ] && return 0', 'reality)', '-p)', '-p 需要端口值', '未知参数: $1']:
         assert_true(token in parse_body, f"parse_args token missing: {token}")
     cli_install_body = TEXT[TEXT.index('cli_install()'):TEXT.index('\n}\n', TEXT.index('cli_install()'))]
-    for token in ['preset_apply_reality_tcp_default', 'install_execute_current_plan']:
+    for token in ['preset_apply_reality_tcp_default', '_CLI_REALITY_PORT', 'install_execute_current_plan']:
         assert_true(token in cli_install_body, f"cli_install token missing: {token}")
     preset_body = TEXT[TEXT.index('preset_apply_reality_tcp_default()'):TEXT.index('\n}\n', TEXT.index('preset_apply_reality_tcp_default()'))]
-    for token in ['.reality.enabled = true', '.reality.network = "tcp"', '.argo.enabled = false', '.ff.enabled = false', '.vltcp.enabled = false', '.socks.enabled = false', '.vlquic.enabled = false', '.cforigin.enabled = false']:
+    for token in ['local _port _explicit_port', 'val_port "${_explicit_port}"', '.reality.enabled = true', '.reality.network = "tcp"', '.argo.enabled = false', '.ff.enabled = false', '.vltcp.enabled = false', '.socks.enabled = false', '.vlquic.enabled = false', '.cforigin.enabled = false']:
         assert_true(token in preset_body, f"reality tcp preset missing: {token}")
-    assert_true('reality_pick_default_tcp_port' in preset_body and '.ports.reality = ($p|tonumber)' in preset_body, "reality preset should set port through auto-selection helper")
+    assert_true('reality_pick_default_tcp_port' in preset_body and '.ports.reality = ($p|tonumber)' in preset_body, "reality preset should set port through helper or explicit override")
     pick_body = TEXT[TEXT.index('reality_pick_default_tcp_port()'):TEXT.index('\n}\n', TEXT.index('reality_pick_default_tcp_port()'))]
     for token in ['local _preferred=443', 'port_mgr_in_use "${_preferred}"', 'port_mgr_random_proto tcp', '自动改用随机端口']:
         assert_true(token in pick_body, f"reality default port helper token missing: {token}")
@@ -415,16 +415,16 @@ def test_cli_reality_tcp_preset_entry_exists_and_uses_shared_executor():
     out = run_bash("""
         source ./xray_2go.sh
         st_init
-        parse_args reality
-        printf 'alias_action=%s\n' "${_CLI_ACTION}"
-        preset_apply_reality_tcp_default
+        parse_args reality -p 2443
+        printf 'alias_action=%s port_override=%s\n' "${_CLI_ACTION}" "${_CLI_REALITY_PORT}"
+        preset_apply_reality_tcp_default "${_CLI_REALITY_PORT}"
         printf 'argo=%s reality=%s net=%s ff=%s socks=%s vlquic=%s cforigin=%s port=%s\n' \
             "$(st_get '.argo.enabled')" "$(st_get '.reality.enabled')" "$(st_get '.reality.network')" \
             "$(st_get '.ff.enabled')" "$(st_get '.socks.enabled')" "$(st_get '.vlquic.enabled')" \
             "$(st_get '.cforigin.enabled')" "$(port_of reality)"
     """)
-    assert_true('alias_action=install' in out, "reality should enter install mode")
-    assert_true('reality=true net=tcp' in out and 'port=443' in out, "reality tcp preset should apply the expected default state")
+    assert_true('alias_action=install port_override=2443' in out, "reality -p should enter install mode and persist explicit port override")
+    assert_true('reality=true net=tcp' in out and 'port=2443' in out, "reality tcp preset should apply the explicit port override")
 
 
 def test_reality_preset_auto_random_port_when_443_busy():
@@ -437,6 +437,27 @@ def test_reality_preset_auto_random_port_when_443_busy():
         printf 'port=%s\n' "$(port_of reality)"
     """)
     assert_true('port=23456' in out, "reality preset should auto-switch to random high port when 443 is busy")
+
+
+def test_cli_reality_port_option_requires_valid_value():
+    out = run_bash("""
+        source ./xray_2go.sh
+        parse_args reality -p 2443
+        printf 'ok=%s\n' "${_CLI_REALITY_PORT}"
+    """)
+    assert_true('ok=2443' in out, 'reality -p should accept a valid explicit port')
+
+    try:
+        run_bash("source ./xray_2go.sh; parse_args reality -p")
+        raise AssertionError('parse_args reality -p should fail without a value')
+    except subprocess.CalledProcessError as e:
+        assert_true('-p 需要端口值' in e.stdout, 'reality -p without value should fail with a clear error')
+
+    try:
+        run_bash("source ./xray_2go.sh; parse_args reality -p abc")
+        raise AssertionError('parse_args reality -p abc should fail')
+    except subprocess.CalledProcessError as e:
+        assert_true('非法端口' in e.stdout or '端口' in e.stdout, 'reality -p should validate port format')
 
 
 def test_runtime_enable_paths_no_longer_depend_on_removed_ask_helpers():

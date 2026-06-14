@@ -3865,9 +3865,14 @@ reality_pick_default_tcp_port() {
 }
 
 preset_apply_reality_tcp_default() {
-    local _port
+    local _port _explicit_port="${1:-}"
     install_plan_reset_defaults || return 1
-    _port=$(reality_pick_default_tcp_port) || return 1
+    if [ -n "${_explicit_port:-}" ]; then
+        val_port "${_explicit_port}" >/dev/null || return 1
+        _port="${_explicit_port}"
+    else
+        _port=$(reality_pick_default_tcp_port) || return 1
+    fi
     st_set '
         .reality.enabled = true |
         .reality.network = "tcp" |
@@ -5035,16 +5040,20 @@ usage() {
 用法:
   xray2go                 进入交互菜单
   xray2go reality
+  xray2go reality -p <port>
   xray_2go.sh reality
+  xray_2go.sh reality -p <port>
 
 说明:
   - 无参数: 默认进入交互式自定义选项搭建菜单
   - reality: 非交互一键安装 VLESS + Reality (TCP)
+  - reality -p <port>: 使用指定监听端口进行一键安装
 EOF
 }
 
 parse_args() {
     _CLI_ACTION="menu"
+    _CLI_REALITY_PORT=""
 
     [ "$#" -eq 0 ] && return 0
 
@@ -5060,11 +5069,23 @@ parse_args() {
             return 1 ;;
     esac
 
-    [ "$#" -eq 0 ] || { log_error "未知参数: $1"; return 1; }
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -p)
+                shift
+                [ "$#" -gt 0 ] || { log_error "-p 需要端口值"; return 1; }
+                val_port "$1" >/dev/null || return 1
+                _CLI_REALITY_PORT="$1"
+                shift ;;
+            *)
+                log_error "未知参数: $1"
+                return 1 ;;
+        esac
+    done
 }
 
 cli_install() {
-    preset_apply_reality_tcp_default || return 1
+    preset_apply_reality_tcp_default "${_CLI_REALITY_PORT:-}" || return 1
     install_execute_current_plan
 }
 
