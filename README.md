@@ -56,9 +56,17 @@ bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/m
 bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) reality
 ```
 
+### 非交互一键安装：Reality + 自定义监听端口
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/Luckylos/xray-2go/refs/heads/main/xray_2go.sh) reality -p 2443
+```
+
 说明：
 - 仅 `reality` 会直接触发非交互安装
-- 默认优先尝试 `443`，若 `443` 已被占用，则自动切换到随机高位 TCP 端口
+- `reality`：默认优先尝试 `443`，若 `443` 已被占用，则自动切换到随机高位 TCP 端口
+- `reality -p <port>`：使用你指定的 Reality TCP 监听端口，不再自动优先尝试 `443`
+- `-p` 后必须显式传入合法端口号，例如 `2443`、`8443`
 
 ### 下载后运行
 
