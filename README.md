@@ -14,6 +14,8 @@ Xray-2go 是一个面向 Linux VPS 的交互式 Xray 安装与管理脚本，支
   - FreeFlow：VLESS + WS / HTTPUpgrade / XHTTP / TCP HTTP 伪装
   - Reality：VLESS + Reality TCP Vision / XHTTP Reality
   - VLESS-TCP：明文落地，可配置监听地址
+  - SOCKS5：账号密码认证，可配置监听端口与地址
+  - HTTP 代理：账号密码认证，可配置监听端口与地址；协议本身为明文 TCP，公开监听前请确认防火墙与网络边界
 - 自动生成并打印分享链接
 - 支持修改 UUID、端口、路径、域名、Reality 目标站点等常用参数
 - xPadding 支持按协议独立开关，可实现 Argo 开启、Reality 关闭等组合

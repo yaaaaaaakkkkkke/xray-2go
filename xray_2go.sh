@@ -2,7 +2,7 @@
 # ==============================================================================
 # xray-2go — 插件化代理管理脚本
 # 安全基线：输入校验 · 敏感文件保护 · 原子写入 · 服务互斥 · 可回滚清理
-# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP · VLESS-XHTTP-H3（均以插件形式加载）
+# 协议支持：Argo · FreeFlow · Reality · VLESS-TCP · SOCKS5 · HTTP · VLESS-XHTTP-H3（均以插件形式加载）
 # 平台支持：Debian/Ubuntu/RHEL系 (systemd) · Alpine (OpenRC；Argo/cloudflared 需用户预装官方 cloudflared)
 # ==============================================================================
 set -uo pipefail  # 交互菜单使用显式返回值处理，避免 set -e 造成误退出
@@ -363,7 +363,8 @@ readonly _STATE_DEFAULT='{
     "vltcp":   1234,
     "vlquic":  443,
     "cforigin": 28888,
-    "socks":   1080
+    "socks":   1080,
+    "http":    1081
   },
   "argo": {
     "enabled":  true,
@@ -393,6 +394,12 @@ readonly _STATE_DEFAULT='{
     "listen":  "0.0.0.0"
   },
   "socks": {
+    "enabled": false,
+    "listen":  "0.0.0.0",
+    "user":    "xray2go",
+    "pass":    "xray2go"
+  },
+  "http": {
     "enabled": false,
     "listen":  "0.0.0.0",
     "user":    "xray2go",
@@ -533,7 +540,7 @@ xpad_of() {
 # 统一端口读取接口（单一数据源）
 # 所有模块禁止硬编码端口，必须调用此函数
 port_of() {
-    # 用法：port_of argo / ff / reality / vltcp / vlquic / cforigin
+    # 用法：port_of argo / ff / reality / vltcp / vlquic / cforigin / socks / http
     local _v; _v=$(st_get ".ports.${1}")
     [ -n "${_v:-}" ] && [ "${_v}" != "null" ] && printf '%s' "${_v}" || printf '0'
 }
@@ -686,7 +693,7 @@ st_persist() { with_lock _st_persist_inner; }
 _st_normalize_schema() {
 
     # 规范化端口字段到顶层 ports
-    local _ap _rp _vp _qp _fp _cp _sp
+    local _ap _rp _vp _qp _fp _cp _sp _hp
     _ap=$(st_get '.argo.port    // empty')
     _rp=$(st_get '.reality.port // empty')
     _vp=$(st_get '.vltcp.port   // empty')
@@ -694,11 +701,12 @@ _st_normalize_schema() {
     _fp=$(st_get '.ff.port      // empty')
     _cp=$(st_get '.cforigin.port // empty')
     _sp=$(st_get '.socks.port   // empty')
+    _hp=$(st_get '.http.port    // empty')
 
     # 若 .ports 不存在则初始化
     local _ports; _ports=$(st_get '.ports')
     if [ -z "${_ports:-}" ] || [ "${_ports}" = "null" ]; then
-        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080}'
+        st_set '.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080,"http":1081}'
     fi
 
     _st_migrate_port() {
@@ -720,6 +728,7 @@ _st_normalize_schema() {
     _st_migrate_port '.ff.port' '.ports.ff' "${_fp}"
     _st_migrate_port '.cforigin.port' '.ports.cforigin' "${_cp}"
     _st_migrate_port '.socks.port' '.ports.socks' "${_sp}"
+    _st_migrate_port '.http.port' '.ports.http' "${_hp}"
 
     # 补全缺失/损坏端口字段，避免菜单显示 0 或修改端口后写入无效路径
     local _c
@@ -737,6 +746,8 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.cforigin = 28888'
     _c=$(st_get '.ports.socks')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.socks = 1080'
+    _c=$(st_get '.ports.http')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ] || [ "${_c}" = "0" ]; } && st_set '.ports.http = 1081'
 
     _c=$(st_get '.reality.network')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.reality.network = "tcp"'
@@ -789,6 +800,14 @@ _st_normalize_schema() {
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.user = "xray2go"'
     _c=$(st_get '.socks.pass')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.socks.pass = "xray2go"'
+    _c=$(st_get '.http.enabled')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.enabled = false'
+    _c=$(st_get '.http.listen')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.listen = "0.0.0.0"'
+    _c=$(st_get '.http.user')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.user = "xray2go"'
+    _c=$(st_get '.http.pass')
+    { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.http.pass = "xray2go"'
     _c=$(st_get '.vlquic.listen')
     { [ -z "${_c:-}" ] || [ "${_c}" = "null" ]; } && st_set '.vlquic.listen = "0.0.0.0"'
     _c=$(st_get '.vlquic.domain')
@@ -950,7 +969,7 @@ _plugin_snapshot_rebuild() {
         [ -n "${_p:-}" ] && _PLUGIN_SNAPSHOT_PORTS="${_PLUGIN_SNAPSHOT_PORTS}$(printf '%s\n' "${_p}")"
 
         _l=$(plugin_call "${_name}" link 2>/dev/null) || true
-        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks)://' || true)"$'\n'
+        [ -n "${_l:-}" ] && _PLUGIN_SNAPSHOT_LINKS="${_PLUGIN_SNAPSHOT_LINKS}$(printf '%s\n' "${_l}" | grep -E '^(vless|trojan|socks|http)://' || true)"$'\n'
 
         _ib=$(plugin_call "${_name}" inbound 2>/dev/null) || {
             log_error "插件 inbound 失败: ${_name}"; return 1; }
@@ -1014,12 +1033,13 @@ plugin_collect_inbounds() {
 plugin_install_builtins() {
     mkdir -p "${PLUGIN_DIR}"
     # 内置插件属于脚本本体的一部分：每次运行刷新，确保主脚本更新能同步下发。
-    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp 重名。
+    # 用户自定义插件请使用其它文件名，避免与 argo/ff/reality/vltcp/socks/http 重名。
     _plugin_write_argo
     _plugin_write_ff
     _plugin_write_reality
     _plugin_write_vltcp
     _plugin_write_socks
+    _plugin_write_http
     _plugin_write_vlquic
     _plugin_write_cforigin
 }
@@ -1385,6 +1405,46 @@ _plg_socks_link() {
 }
 PLUGIN_EOF
     chmod 644 "${PLUGIN_DIR}/socks.sh"
+}
+
+_plugin_write_http() {
+cat > "${PLUGIN_DIR}/http.sh" << 'PLUGIN_EOF'
+# xray-2go plugin: http (HTTP proxy inbound)
+
+_plg_http_enabled() {
+    [ "$(st_get '.http.enabled')" = "true" ]
+}
+
+_plg_http_ports() {
+    _plg_http_enabled || return 0
+    port_of http
+}
+
+_plg_http_inbound() {
+    _plg_http_enabled || return 0
+    local _port _listen _user _pass
+    _port=$(port_of http)
+    _listen=$(st_get '.http.listen')
+    _user=$(st_get '.http.user')
+    _pass=$(st_get '.http.pass')
+    jq -n --argjson port "${_port}" --arg listen "${_listen}" --arg user "${_user}" --arg pass "${_pass}" '{
+        port:$port, listen:$listen, protocol:"http",
+        settings:{users:[{user:$user, pass:$pass}], allowTransparent:false, userLevel:0}
+    }'
+}
+
+_plg_http_link() {
+    _plg_http_enabled || return 0
+    local _ip _port _user _pass
+    _ip=$(platform_get_realip)
+    [ -z "${_ip:-}" ] && { log_warn "无法获取服务器 IP，HTTP 代理节点已跳过"; return 0; }
+    _port=$(port_of http)
+    _user=$(urlencode_path "$(st_get '.http.user')")
+    _pass=$(urlencode_path "$(st_get '.http.pass')")
+    printf 'http://%s:%s@%s:%s#HTTP-Proxy\n' "${_user}" "${_pass}" "${_ip}" "${_port}"
+}
+PLUGIN_EOF
+    chmod 644 "${PLUGIN_DIR}/http.sh"
 }
 
 _plugin_write_cforigin() {
@@ -2387,7 +2447,7 @@ _module_enable_with_state() {
 module_update_port_action() {
     local _proto="${1:-}" _net="${2:-tcp}" _label_suffix="${3:-}"
     case "${_proto}" in
-        ff|reality|vltcp|vlquic|socks)
+        ff|reality|vltcp|vlquic|socks|http)
             _menu_update_port "${_proto}" "${_net}" "${_label_suffix}"
             ;;
         *)
@@ -2401,6 +2461,7 @@ module_update_listen_action() {
     local _proto="${1:-}" _en _l _label
     case "${_proto}" in
         socks)  _label="SOCKS5" ;;
+        http)   _label="HTTP 代理" ;;
         vltcp)  _label="VLESS-TCP" ;;
         vlquic) _label="VLESS-XHTTP-H3" ;;
         *)
@@ -2500,6 +2561,34 @@ module_socks_disable() {
     module_socks_action disable
 }
 
+module_http_action() {
+    local _action="${1:-}"
+    case "${_action}" in
+        enable)
+            case "$(st_get '.http.listen')" in
+                0.0.0.0|::) log_warn "HTTP 代理为明文协议，当前监听所有接口，请确认防火墙与网络边界" ;;
+            esac
+            _module_enable_with_state '.http.enabled = true' "HTTP 代理" || return 1
+            ;;
+        disable)
+            _module_disable_transaction "HTTP 代理" st_set '.http.enabled = false' || return 1
+            log_ok "HTTP 代理已禁用"
+            ;;
+        *)
+            log_error "HTTP 代理不支持动作: ${_action}"
+            return 1
+            ;;
+    esac
+}
+
+module_http_enable() {
+    module_http_action enable
+}
+
+module_http_disable() {
+    module_http_action disable
+}
+
 _module_cforigin_enable_prepare() {
     local _proto _path _listen _edge
     _proto=$(st_get '.cforigin.protocol')
@@ -2592,6 +2681,56 @@ module_socks_update_pass() {
     st_set '.socks.pass = $p' --arg p "${_pass}" || return 1
     _module_persist_after_optional_apply "${_en}" || return 1
     log_ok "SOCKS5 密码已更新"
+    [ "${_en}" = "true" ] && config_print_nodes
+}
+
+module_http_uninstall() {
+    _module_disable_transaction "HTTP 代理" st_set '.http.enabled = false | .http.listen = "0.0.0.0" | .http.user = "xray2go" | .http.pass = "xray2go" | .ports.http = 1081' || return 1
+    log_ok "HTTP 代理已卸载"
+}
+
+module_http_update_port() {
+    module_update_port_action http tcp
+}
+
+module_http_update_listen() {
+    module_update_listen_action http
+}
+
+module_http_update_auth() {
+    local _en _user _pass _du
+    _en=$(st_get '.http.enabled')
+    _du=$(st_get '.http.user')
+    prompt "新用户名（回车保持 ${_du}）: " _user
+    _user="${_user:-${_du}}"
+    prompt_secret "新密码（回车保持当前）: " _pass
+    [ -z "${_pass:-}" ] && _pass=$(st_get '.http.pass')
+    st_set '.http.user = $u | .http.pass = $p' --arg u "${_user}" --arg p "${_pass}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "HTTP 代理账号已更新: ${_user}"
+    [ "${_en}" = "true" ] && config_print_nodes
+}
+
+module_http_update_user() {
+    local _en _du _user
+    _en=$(st_get '.http.enabled')
+    _du=$(st_get '.http.user')
+    prompt "新用户名（回车保持 ${_du}）: " _user
+    _user="${_user:-${_du}}"
+    st_set '.http.user = $u' --arg u "${_user}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "HTTP 代理用户名已更新: ${_user}"
+    [ "${_en}" = "true" ] && config_print_nodes
+}
+
+module_http_update_pass() {
+    local _en _pass
+    _en=$(st_get '.http.enabled')
+    prompt_secret "新密码（回车保持当前）: " _pass
+    [ -n "${_pass:-}" ] || return 0
+    st_set '.http.pass = $p' --arg p "${_pass}" || return 1
+    _module_persist_after_optional_apply "${_en}" || return 1
+    log_ok "HTTP 代理密码已更新"
     [ "${_en}" = "true" ] && config_print_nodes
 }
 module_vlquic_uninstall() {
@@ -3939,7 +4078,7 @@ module_config_update_uuid() {
 
 # ── 单文件模块注册表 / 管理子菜单辅助 ─────────────────────────────────────────
 
-_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"
+_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"
 
 module_label() {
     case "${1:-}" in
@@ -3950,6 +4089,7 @@ module_label() {
         vlquic)   printf 'VLESS-XHTTP-H3' ;;
         cforigin) printf 'CF Origin' ;;
         socks)    printf 'SOCKS5' ;;
+        http)     printf 'HTTP 代理' ;;
         *)        printf '%s' "${1:-unknown}" ;;
     esac
 }
@@ -3993,6 +4133,14 @@ module_summary() {
             [ "$(st_get '.cforigin.enabled')" = "true" ] \
                 && printf '%s' "已启用 ($(st_get '.cforigin.protocol'), edge=$(st_get '.cforigin.edge_port'), h3=$(st_get '.cforigin.edge_h3'), origin=$(port_of cforigin), domain=$(st_get '.cforigin.domain'))" \
                 || printf '未启用' ;;
+        socks)
+            [ "$(st_get '.socks.enabled')" = "true" ] \
+                && printf '%s' "已启用 (port=$(port_of socks), listen=$(st_get '.socks.listen'), user=$(st_get '.socks.user'))" \
+                || printf '未启用' ;;
+        http)
+            [ "$(st_get '.http.enabled')" = "true" ] \
+                && printf '%s' "已启用 (port=$(port_of http), listen=$(st_get '.http.listen'), user=$(st_get '.http.user'))" \
+                || printf '未启用' ;;
         *)
             printf 'unknown' ;;
     esac
@@ -4001,7 +4149,7 @@ module_summary() {
 module_show_action() {
     local _mod="${1:-}"
     case "${_mod}" in
-        all|argo|ff|reality|vltcp|vlquic|socks)
+        all|argo|ff|reality|vltcp|vlquic|socks|http)
             config_print_nodes
             ;;
         cforigin)
@@ -4111,6 +4259,7 @@ module_dispatch() {
         vlquic:menu)   unified_menu_vlquic runtime ;;
         cforigin:menu) unified_menu_cforigin runtime ;;
         socks:menu)    unified_menu_socks runtime ;;
+        http:menu)     unified_menu_http runtime ;;
 
         # shared runtime actions
         argo:restart) module_restart_action argo ;;
@@ -4119,6 +4268,7 @@ module_dispatch() {
         vltcp:restart) module_restart_action xray ;;
         vlquic:restart) module_restart_action xray ;;
         cforigin:restart) module_restart_action xray ;;
+        http:restart) module_restart_action xray ;;
         argo:show) module_show_action argo ;;
         ff:show) module_show_action ff ;;
         reality:show) module_show_action reality ;;
@@ -4126,6 +4276,7 @@ module_dispatch() {
         vlquic:show) module_show_action vlquic ;;
         cforigin:show) module_show_action cforigin ;;
         socks:show) module_show_action socks ;;
+        http:show) module_show_action http ;;
 
         # lifecycle actions
         argo:enable) module_argo_enable ;;
@@ -4142,6 +4293,8 @@ module_dispatch() {
         cforigin:disable) module_cforigin_disable ;;
         socks:enable) module_socks_action enable ;;
         socks:disable) module_socks_action disable ;;
+        http:enable) module_http_action enable ;;
+        http:disable) module_http_action disable ;;
 
         # uninstall/update-port actions
         argo:uninstall) module_argo_uninstall ;;
@@ -4151,6 +4304,7 @@ module_dispatch() {
         vlquic:uninstall) module_vlquic_uninstall ;;
         cforigin:uninstall) module_cforigin_uninstall ;;
         socks:uninstall) module_socks_uninstall ;;
+        http:uninstall) module_http_uninstall ;;
         argo:update_port) module_argo_update_port ;;
         ff:update_port) module_update_port_action ff tcp ;;
         reality:update_port) module_update_port_action reality tcp ;;
@@ -4158,6 +4312,7 @@ module_dispatch() {
         vlquic:update_port) module_update_port_action vlquic udp udp ;;
         cforigin:update_port) module_cforigin_update_port ;;
         socks:update_port) module_update_port_action socks tcp ;;
+        http:update_port) module_update_port_action http tcp ;;
 
         # field/config update actions
         argo:update_protocol) module_argo_update_action protocol ;;
@@ -4178,6 +4333,10 @@ module_dispatch() {
         socks:update_auth) module_socks_update_auth ;;
         socks:update_user) module_socks_update_user ;;
         socks:update_pass) module_socks_update_pass ;;
+        http:update_listen) module_update_listen_action http ;;
+        http:update_auth) module_http_update_auth ;;
+        http:update_user) module_http_update_user ;;
+        http:update_pass) module_http_update_pass ;;
 
         # key/toggle actions
         reality:update_sni) module_reality_update_sni ;;
@@ -4341,6 +4500,7 @@ _menu_collect_status() {
     _MENU_QD=$(module_summary vlquic)
     _MENU_CD=$(module_summary cforigin)
     _MENU_SD=$(module_summary socks)
+    _MENU_HD=$(module_summary http)
 }
 
 _menu_render() {
@@ -4356,6 +4516,7 @@ _menu_render() {
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  CF-Origin: %-29s${C_PUR} ${C_RST}\n" "${_MENU_CD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  FF       : %-29s${C_PUR} ${C_RST}\n" "${_MENU_FD}"
     printf "${C_BOLD}${C_PUR}  ║${C_RST}  SOCKS5   : %-29s${C_PUR} ${C_RST}\n" "${_MENU_SD}"
+    printf "${C_BOLD}${C_PUR}  ║${C_RST}  HTTP代理  : %-29s${C_PUR} ${C_RST}\n" "${_MENU_HD}"
     printf "${C_BOLD}${C_PUR}  ╚══════════════════════════════════════════╝${C_RST}\n\n"
     printf "  ${C_GRN}1.${C_RST} 开始部署（快速向导）\n"
     printf "  ${C_RED}2.${C_RST} 卸载整套 Xray-2go\n"; _hr
@@ -4367,7 +4528,8 @@ _menu_render() {
     printf "  ${C_GRN}8.${C_RST} 管理 CF Origin 回源\n"
     printf "  ${C_GRN}9.${C_RST} 查看节点与连接提示\n"
     printf "  ${C_GRN}10.${C_RST} 更新 UUID\n"
-    printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"; _hr
+    printf "  ${C_GRN}11.${C_RST} 管理 SOCKS5 入站\n"
+    printf "  ${C_GRN}12.${C_RST} 管理 HTTP 代理入站\n"; _hr
     printf "  ${C_GRN}s.${C_RST} 更新快捷方式/脚本\n"; _hr
     printf "  ${C_RED}0.${C_RST} 退出程序\n\n"
     printf "  说明: ${C_YLW}首次部署进入快速向导，已安装时进入管理菜单${C_RST}；命令行 ${C_CYN}reality${C_RST} 可一键安装 VLESS + Reality (TCP)\n\n"
@@ -4405,6 +4567,10 @@ install_plan_reset_defaults() {
         .socks.listen = "0.0.0.0" |
         .socks.user = "xray2go" |
         .socks.pass = "xray2go" |
+        .http.enabled = false |
+        .http.listen = "0.0.0.0" |
+        .http.user = "xray2go" |
+        .http.pass = "xray2go" |
         .vlquic.enabled = false |
         .vlquic.listen = "0.0.0.0" |
         .vlquic.domain = "" |
@@ -4458,6 +4624,7 @@ preset_apply_reality_tcp_default() {
         .ff.protocol = "none" |
         .vltcp.enabled = false |
         .socks.enabled = false |
+        .http.enabled = false |
         .vlquic.enabled = false |
         .cforigin.enabled = false
     ' --arg p "${_port}" || return 1
@@ -4470,6 +4637,7 @@ install_plan_has_enabled_module() {
     [ "$(st_get '.reality.enabled')" = "true" ] && return 0
     [ "$(st_get '.vltcp.enabled')" = "true" ] && return 0
     [ "$(st_get '.socks.enabled')" = "true" ] && return 0
+    [ "$(st_get '.http.enabled')" = "true" ] && return 0
     [ "$(st_get '.vlquic.enabled')" = "true" ] && return 0
     [ "$(st_get '.cforigin.enabled')" = "true" ] && return 0
     return 1
@@ -4496,6 +4664,8 @@ install_plan_module_summary() {
             [ "$(st_get '.vltcp.enabled')" = "true" ]                 && printf '%s' "已启用 (port=$(port_of vltcp), listen=$(st_get '.vltcp.listen'))"                 || printf '未启用' ;;
         socks)
             [ "$(st_get '.socks.enabled')" = "true" ]                 && printf '%s' "已启用 (port=$(port_of socks), listen=$(st_get '.socks.listen'), user=$(st_get '.socks.user'))"                 || printf '未启用' ;;
+        http)
+            [ "$(st_get '.http.enabled')" = "true" ]                 && printf '%s' "已启用 (port=$(port_of http), listen=$(st_get '.http.listen'), user=$(st_get '.http.user'))"                 || printf '未启用' ;;
         vlquic)
             [ "$(st_get '.vlquic.enabled')" = "true" ]                 && printf '%s' "已启用 (udp=$(port_of vlquic), domain=$(st_get '.vlquic.domain'))"                 || printf '未启用' ;;
         cforigin)
@@ -4514,6 +4684,7 @@ install_plan_render_summary() {
     printf "  Reality   : %s\n" "$(install_plan_module_summary reality)"
     printf "  VLESS-TCP : %s\n" "$(install_plan_module_summary vltcp)"
     printf "  SOCKS5    : %s\n" "$(install_plan_module_summary socks)"
+    printf "  HTTP代理  : %s\n" "$(install_plan_module_summary http)"
     printf "  XHTTP-H3  : %s\n" "$(install_plan_module_summary vlquic)"
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     _hr
@@ -4531,6 +4702,7 @@ install_plan_render_summary() {
     _menu_print_action 9 "重置为初始安装计划" "${C_YLW}"
     _menu_print_action 10 "运行安装前检查"
     _menu_print_action 11 "开始安装" "${C_GRN}"
+    _menu_print_action 12 "进入 HTTP 代理配置页"
     _menu_print_action 0 "取消安装并返回主菜单" "${C_PUR}"
     _hr
 }
@@ -4879,6 +5051,58 @@ install_plan_socks_update_pass() {
     log_ok "SOCKS5 密码已更新"
 }
 
+install_plan_http_toggle() {
+    [ "$(st_get '.http.enabled')" = "true" ] \
+        && st_set '.http.enabled = false' \
+        || st_set '.http.enabled = true' || return 1
+    [ "$(st_get '.http.enabled')" = "true" ] && \
+        log_warn "HTTP 代理为明文 TCP 代理，公开监听前请确认网络边界与防火墙策略"
+    log_ok "HTTP 代理已$( [ "$(st_get '.http.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
+}
+
+install_plan_http_update_port() {
+    local _hp _dp
+    _dp=$(port_of http)
+    prompt "HTTP 代理监听端口（回车默认 ${_dp}）: " _hp
+    if [ -n "${_hp:-}" ]; then
+        if val_port "${_hp}" >/dev/null 2>&1; then
+            st_set '.ports.http = ($p|tonumber)' --arg p "${_hp}" || return 1
+        else
+            log_warn "端口无效，使用默认值 ${_dp}"
+        fi
+    fi
+    port_mgr_in_use "$(port_of http)" && log_warn "TCP/$(port_of http) 已被占用"
+    log_ok "HTTP 代理端口已设置为: $(port_of http)"
+}
+
+install_plan_http_update_listen() {
+    local _dl _hl
+    _dl=$(st_get '.http.listen')
+    prompt "HTTP 代理监听地址（回车默认 ${_dl}，0.0.0.0=所有接口）: " _hl
+    [ -n "${_hl:-}" ] || { log_info "保持监听地址: ${_dl}"; return 0; }
+    _hl=$(val_listen_addr "${_hl}") || { log_warn "监听地址不合法，使用默认值 ${_dl}"; return 0; }
+    st_set '.http.listen = $l' --arg l "${_hl}" || return 1
+    log_warn "HTTP 代理为明文协议，请勿在不可信公网直接暴露"
+    log_ok "HTTP 代理监听地址已设置为: $(st_get '.http.listen')"
+}
+
+install_plan_http_update_user() {
+    local _du _user
+    _du=$(st_get '.http.user')
+    prompt "HTTP 代理用户名（回车默认 ${_du}）: " _user
+    _user="${_user:-${_du}}"
+    st_set '.http.user = $u' --arg u "${_user}" || return 1
+    log_ok "HTTP 代理用户名已设置为: $(st_get '.http.user')"
+}
+
+install_plan_http_update_pass() {
+    local _pass
+    prompt_secret "HTTP 代理密码（回车保持当前）: " _pass
+    [ -n "${_pass:-}" ] || { log_info "保持当前 HTTP 代理密码"; return 0; }
+    st_set '.http.pass = $p' --arg p "${_pass}" || return 1
+    log_ok "HTTP 代理密码已更新"
+}
+
 install_plan_cforigin_toggle() {
     [ "$(st_get '.cforigin.enabled')" = "true" ]         && st_set '.cforigin.enabled = false'         || st_set '.cforigin.enabled = true' || return 1
     log_ok "CF Origin 已$( [ "$(st_get '.cforigin.enabled')" = "true" ] && printf '启用' || printf '禁用' )"
@@ -5064,6 +5288,13 @@ install_plan_validate() {
         val_port "$(port_of socks)" >/dev/null || return 1
         val_listen_addr "$(st_get '.socks.listen')" >/dev/null || return 1
         [ -n "$(st_get '.socks.user')" ] || { log_error "SOCKS5 用户名不能为空"; return 1; }
+    fi
+
+    if [ "$(st_get '.http.enabled')" = "true" ]; then
+        val_port "$(port_of http)" >/dev/null || return 1
+        val_listen_addr "$(st_get '.http.listen')" >/dev/null || return 1
+        [ -n "$(st_get '.http.user')" ] || { log_error "HTTP 代理用户名不能为空"; return 1; }
+        [ -n "$(st_get '.http.pass')" ] || { log_error "HTTP 代理密码不能为空"; return 1; }
     fi
 
     if [ "$(st_get '.vlquic.enabled')" = "true" ]; then
@@ -5634,6 +5865,61 @@ unified_menu_socks() {
     done
 }
 
+unified_menu_http() {
+    local _mode="${1:-install}" _runtime=0
+    _unified_mode_is_runtime "${_mode}" && { _runtime=1; _manage_module_entry_check || return; }
+    while true; do
+        local _en _port _listen _user _svc _summary
+        _en=$(st_get '.http.enabled')
+        _port=$(port_of http)
+        _listen=$(st_get '.http.listen')
+        _user=$(st_get '.http.user')
+        _svc=$(_unified_runtime_status_for http)
+        _summary=$(_unified_summary_for "${_runtime}" http)
+        clear; echo ""; log_title "══ HTTP 代理闭环工作台 ══"
+        _unified_render_mode_header "${_mode}" "HTTP 代理为明文 TCP 协议，公开监听前请确认网络边界"
+        _unified_render_status "${_runtime}" "${_en}" "${_svc}"
+        printf "  端口: ${C_YLW}%s${C_RST}  监听: ${C_CYN}%s${C_RST}  用户: ${C_GRN}%s${C_RST}\n" "${_port}" "${_listen}" "${_user}"
+        _hr
+        _menu_print_action 1 "切换启用状态"
+        _menu_print_action 2 "修改监听端口"
+        _menu_print_action 3 "修改监听地址"
+        _menu_print_action 4 "修改用户名"
+        _menu_print_action 5 "修改密码"
+        _menu_print_action 6 "查看当前节点摘要"
+        if [ "${_runtime}" -eq 1 ]; then
+            _hr
+            _menu_print_action r "重启 xray2go 服务"
+            _menu_print_action v "查看节点链接"
+            _menu_print_action u "卸载 HTTP 代理" "${C_RED}"
+        fi
+        _menu_print_back
+        _hr
+        prompt "请选择操作 $( [ "${_runtime}" -eq 1 ] && printf '(0-6/r/v/u)' || printf '(0-6)' ): " _c
+        case "${_c:-}" in
+            1) _unified_toggle_or_plan "${_runtime}" http "${_en}" install_plan_http_toggle || true ;;
+            2) _unified_dispatch_or_plan "${_runtime}" http update_port install_plan_http_update_port || true ;;
+            3) _unified_dispatch_or_plan "${_runtime}" http update_listen install_plan_http_update_listen || true ;;
+            4) _unified_dispatch_or_plan "${_runtime}" http update_user install_plan_http_update_user || true ;;
+            5) _unified_dispatch_or_plan "${_runtime}" http update_pass install_plan_http_update_pass || true ;;
+            6) log_info "HTTP 代理: ${_summary}" ;;
+            r) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue http restart || true ;;
+            v) _unified_runtime_only_fn "${_runtime}" _module_action_or_continue http show || true ;;
+            u)
+                if [ "${_runtime}" -eq 1 ]; then
+                    _menu_confirm_uninstall "HTTP 代理" || { _pause; continue; }
+                    _module_action_or_continue http uninstall || continue
+                    _pause; return 0
+                else
+                    log_error "无效选项，请按提示输入"
+                fi ;;
+            0) return 0 ;;
+            *) log_error "无效选项，请按提示输入" ;;
+        esac
+        _pause
+    done
+}
+
 install_wizard_render() {
     clear; echo ""
     log_title "══ 快速部署向导 ══"
@@ -5654,6 +5940,7 @@ install_wizard_confirm() {
     printf "  Reality   : %s\n" "$(install_plan_module_summary reality)"
     printf "  VLESS-TCP : %s\n" "$(install_plan_module_summary vltcp)"
     printf "  SOCKS5    : %s\n" "$(install_plan_module_summary socks)"
+    printf "  HTTP代理  : %s\n" "$(install_plan_module_summary http)"
     printf "  XHTTP-H3  : %s\n" "$(install_plan_module_summary vlquic)"
     printf "  CF-Origin : %s\n" "$(install_plan_module_summary cforigin)"
     _hr
@@ -5729,7 +6016,7 @@ install_plan_menu() {
     while true; do
         install_plan_render_summary
         local _c
-        prompt "请选择操作 (0-11): " _c
+        prompt "请选择操作 (0-12): " _c
         echo ""
         case "${_c:-}" in
             1) unified_menu_argo install || true ;;
@@ -5745,10 +6032,11 @@ install_plan_menu() {
             11)
                 install_execute_current_plan && return 0
                 ;;
+            12) unified_menu_http install || true ;;
             0)
                 log_info "已取消安装并返回主菜单"
                 return 0 ;;
-            *) log_error "无效选项，请输入 0-11" ;;
+            *) log_error "无效选项，请输入 0-12" ;;
         esac
         _pause
     done
@@ -5766,11 +6054,11 @@ module_xray_install() {
 }
 menu() {
     local _MENU_XS="" _MENU_XC="" _MENU_CX=1 _MENU_XI=0
-    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD=""
+    local _MENU_AD="" _MENU_FD="" _MENU_RD="" _MENU_VD="" _MENU_QD="" _MENU_CD="" _MENU_SD="" _MENU_HD=""
     while true; do
         _menu_collect_status
         _menu_render
-        local _c; prompt "请选择操作 (0-11/s): " _c; echo ""
+        local _c; prompt "请选择操作 (0-12/s): " _c; echo ""
         case "${_c:-}" in
             1) module_dispatch xray install ;;
             2) module_dispatch xray uninstall ;;
@@ -5781,11 +6069,12 @@ menu() {
             7) module_dispatch ff ;;
             8) module_dispatch cforigin ;;
             11) module_dispatch socks ;;
+            12) module_dispatch http ;;
             9) module_dispatch nodes show ;;
             10) module_dispatch config update_uuid ;;
             s) module_dispatch config update_shortcut ;;
             0) log_info "已退出"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-11 或 s" ;;
+            *) log_error "无效选项，请输入 0-12 或 s" ;;
         esac
         _pause
     done

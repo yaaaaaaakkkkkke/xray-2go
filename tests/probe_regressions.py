@@ -331,7 +331,7 @@ def test_config_detects_wildcard_listen_conflicts_and_filters_links():
     assert_true('_used_wild_ports' in TEXT and '_used_exact_keys' in TEXT, "config build must track wildcard ports and exact listen keys separately")
     assert_true('printf \'%s\\n\' "${_used_wild_ports}" | grep -qxF "${_port}"' in TEXT, "specific listen must conflict with existing wildcard same-port listener")
     assert_true('printf \'%s\\n\' "${_used_exact_keys}" | grep -qE ":${_port}$"' in TEXT, "wildcard listen must conflict with existing specific same-port listener")
-    assert_true("^(vless|trojan|socks)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
+    assert_true("^(vless|trojan|socks|http)://" in TEXT and "grep -E" in TEXT, "node output should filter plugin link noise and print supported share links")
 
 
 def test_plugin_loader_validates_before_source_and_loads_in_subshell():
@@ -480,14 +480,14 @@ def test_menu_status_and_commit_helpers_are_shared():
 
 
 def test_single_file_module_registry_drives_main_status():
-    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"' in TEXT, "single-file module registry must list all modules")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"' in TEXT, "single-file module registry must list all modules")
     assert_true('module_summary()' in TEXT and 'module_label()' in TEXT, "module metadata helpers missing")
     collect_body = TEXT[TEXT.index('_menu_collect_status()'):TEXT.index('_menu_render()')]
-    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks']:
+    for mod in ['argo', 'ff', 'reality', 'vltcp', 'vlquic', 'cforigin', 'socks', 'http']:
         assert_true(f'module_summary {mod}' in collect_body, f"main status should be driven by module_summary for {mod}")
     assert_true('module_dispatch()' in TEXT, "module dispatcher skeleton missing")
     menu_body = TEXT[TEXT.index('menu()'):TEXT.index('# ==============================================================================', TEXT.index('menu()'))]
-    for key, mod in [('1', 'xray install'), ('2', 'xray uninstall'), ('3', 'argo'), ('4', 'reality'), ('5', 'vltcp'), ('6', 'vlquic'), ('7', 'ff'), ('8', 'cforigin'), ('9', 'nodes show'), ('10', 'config update_uuid'), ('s', 'config update_shortcut')]:
+    for key, mod in [('1', 'xray install'), ('2', 'xray uninstall'), ('3', 'argo'), ('4', 'reality'), ('5', 'vltcp'), ('6', 'vlquic'), ('7', 'ff'), ('8', 'cforigin'), ('9', 'nodes show'), ('10', 'config update_uuid'), ('11', 'socks'), ('12', 'http'), ('s', 'config update_shortcut')]:
         assert_true(f'{key}) module_dispatch {mod} ;;' in menu_body, f"main menu should route {mod} via module_dispatch")
     for forbidden in ['_menu_do_install', 'exec_uninstall', 'config_print_nodes', 'cforigin_print_cloudflare_hint', 'exec_update_uuid', 'exec_update_shortcut']:
         assert_true(forbidden not in menu_body, f"main menu should be dispatcher-only, found direct action: {forbidden}")
@@ -495,7 +495,7 @@ def test_single_file_module_registry_drives_main_status():
 
 def test_single_file_module_dispatch_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['_action="${2:-menu}"', 'xray:install)', 'xray:uninstall)', 'nodes:show)', 'config:update_uuid)', 'config:update_shortcut)', 'argo:restart)', 'reality:show)', 'vltcp:show)', 'vlquic:restart)', 'ff:show)', 'cforigin:show)']:
+    for token in ['_action="${2:-menu}"', 'xray:install)', 'xray:uninstall)', 'nodes:show)', 'config:update_uuid)', 'config:update_shortcut)', 'argo:restart)', 'reality:show)', 'vltcp:show)', 'vlquic:restart)', 'ff:show)', 'cforigin:show)', 'socks:show)', 'http:show)']:
         assert_true(token in dispatch_body, f"module_dispatch action route missing: {token}")
     for fn in ['module_xray_install()', 'module_xray_uninstall()', 'module_nodes_show()', 'module_config_update_uuid()', 'module_config_update_shortcut()', 'module_xray_restart()', 'module_argo_restart()', 'module_show_nodes()', 'module_cforigin_show()']:
         assert_true(fn in TEXT, f"module action helper missing: {fn}")
@@ -520,29 +520,29 @@ def test_single_file_module_dispatch_actions():
 
 def test_single_file_module_enable_disable_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['ff:enable)', 'ff:disable)', 'reality:enable)', 'vltcp:disable)', 'cforigin:enable)', 'cforigin:disable)', 'socks:enable)', 'socks:disable)']:
+    for token in ['ff:enable)', 'ff:disable)', 'reality:enable)', 'vltcp:disable)', 'cforigin:enable)', 'cforigin:disable)', 'socks:enable)', 'socks:disable)', 'http:enable)', 'http:disable)']:
         assert_true(token in dispatch_body, f"module_dispatch enable/disable route missing: {token}")
-    for fn in ['module_ff_enable()', 'module_ff_disable()', 'module_reality_enable()', 'module_vltcp_enable()', 'module_cforigin_enable()', 'module_cforigin_disable()', 'module_socks_enable()', 'module_socks_disable()']:
+    for fn in ['module_ff_enable()', 'module_ff_disable()', 'module_reality_enable()', 'module_vltcp_enable()', 'module_cforigin_enable()', 'module_cforigin_disable()', 'module_socks_enable()', 'module_socks_disable()', 'module_http_enable()', 'module_http_disable()']:
         assert_true(fn in TEXT, f"module enable/disable helper missing: {fn}")
-    for body_name, mod, plan_fn in [('unified_menu_freeflow()', 'ff', 'install_plan_ff_toggle'), ('unified_menu_reality()', 'reality', 'install_plan_reality_toggle'), ('unified_menu_vltcp()', 'vltcp', 'install_plan_vltcp_toggle'), ('unified_menu_cforigin()', 'cforigin', 'install_plan_cforigin_toggle'), ('unified_menu_socks()', 'socks', 'install_plan_socks_toggle')]:
+    for body_name, mod, plan_fn in [('unified_menu_freeflow()', 'ff', 'install_plan_ff_toggle'), ('unified_menu_reality()', 'reality', 'install_plan_reality_toggle'), ('unified_menu_vltcp()', 'vltcp', 'install_plan_vltcp_toggle'), ('unified_menu_cforigin()', 'cforigin', 'install_plan_cforigin_toggle'), ('unified_menu_socks()', 'socks', 'install_plan_socks_toggle'), ('unified_menu_http()', 'http', 'install_plan_http_toggle')]:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_unified_toggle_or_plan "${_runtime}"' in body and plan_fn in body, f"{body_name} runtime/install toggle should use shared toggle helper")
 
 def test_single_file_module_uninstall_update_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['ff:uninstall)', 'reality:uninstall)', 'vltcp:uninstall)', 'reality:update_port)', 'vltcp:update_port)', 'vlquic:update_port)', 'cforigin:uninstall)', 'cforigin:update_port)', 'socks:uninstall)']:
+    for token in ['ff:uninstall)', 'reality:uninstall)', 'vltcp:uninstall)', 'reality:update_port)', 'vltcp:update_port)', 'vlquic:update_port)', 'cforigin:uninstall)', 'cforigin:update_port)', 'socks:uninstall)', 'http:uninstall)', 'http:update_port)']:
         assert_true(token in dispatch_body, f"module_dispatch uninstall/update route missing: {token}")
-    for fn in ['module_ff_uninstall()', 'module_reality_uninstall()', 'module_vltcp_uninstall()', 'module_reality_update_port()', 'module_vltcp_update_port()', 'module_vlquic_update_port()', 'module_cforigin_uninstall()', 'module_cforigin_update_port()', 'module_socks_uninstall()']:
+    for fn in ['module_ff_uninstall()', 'module_reality_uninstall()', 'module_vltcp_uninstall()', 'module_reality_update_port()', 'module_vltcp_update_port()', 'module_vlquic_update_port()', 'module_cforigin_uninstall()', 'module_cforigin_update_port()', 'module_socks_uninstall()', 'module_http_uninstall()', 'module_http_update_port()', 'module_http_update_listen()']:
         assert_true(fn in TEXT, f"module uninstall/update helper missing: {fn}")
-    for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()']:
+    for body_name in ['unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()', 'unified_menu_http()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_menu_confirm_uninstall' in body and '_pause; return 0' in body, f"{body_name} should provide runtime uninstall closure inside the unified workbench")
 
 def test_single_file_module_config_update_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['reality:update_transport)', 'vltcp:update_listen)', 'vlquic:update_listen)', 'cforigin:update_protocol)', 'cforigin:update_path)', 'cforigin:update_listen)']:
+    for token in ['reality:update_transport)', 'vltcp:update_listen)', 'vlquic:update_listen)', 'cforigin:update_protocol)', 'cforigin:update_path)', 'cforigin:update_listen)', 'http:update_listen)', 'http:update_auth)', 'http:update_user)', 'http:update_pass)']:
         assert_true(token in dispatch_body, f"module_dispatch config update route missing: {token}")
-    for fn in ['module_reality_update_transport()', 'module_vltcp_update_listen()', 'module_vlquic_update_listen()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()']:
+    for fn in ['module_reality_update_transport()', 'module_vltcp_update_listen()', 'module_vlquic_update_listen()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_http_update_auth()', 'module_http_update_user()', 'module_http_update_pass()']:
         assert_true(fn in TEXT, f"module config update helper missing: {fn}")
     for marker in ['_unified_dispatch_or_plan "${_runtime}" reality update_transport install_plan_reality_update_transport', '_unified_dispatch_or_plan "${_runtime}" vltcp update_listen install_plan_vltcp_update_listen', '_unified_dispatch_or_plan "${_runtime}" vlquic update_listen install_plan_vlquic_update_listen', '_unified_dispatch_or_plan "${_runtime}" cforigin update_protocol install_plan_cforigin_update_protocol', '_unified_dispatch_or_plan "${_runtime}" cforigin update_path install_plan_cforigin_update_path', '_unified_dispatch_or_plan "${_runtime}" cforigin update_listen install_plan_cforigin_update_listen']:
         assert_true(marker in TEXT, f"menu should route config update through shared dispatch helper: {marker}")
@@ -559,11 +559,11 @@ def test_single_file_module_argo_freeflow_actions():
 
 def test_single_file_module_final_complex_actions():
     dispatch_body = TEXT[TEXT.index('module_dispatch()'):TEXT.index('# 交互输入端口', TEXT.index('module_dispatch()'))]
-    for token in ['reality:update_sni)', 'reality:regenerate_keys)', 'vlquic:enable)', 'vlquic:disable)', 'vlquic:update_cert)', 'cforigin:update_cert)', 'cforigin:update_edge_port)', 'cforigin:toggle_edge_h3)', 'cforigin:update_domain)', 'socks:update_user)', 'socks:update_pass)']:
+    for token in ['reality:update_sni)', 'reality:regenerate_keys)', 'vlquic:enable)', 'vlquic:disable)', 'vlquic:update_cert)', 'cforigin:update_cert)', 'cforigin:update_edge_port)', 'cforigin:toggle_edge_h3)', 'cforigin:update_domain)', 'socks:update_user)', 'socks:update_pass)', 'http:update_user)', 'http:update_pass)']:
         assert_true(token in dispatch_body, f"module_dispatch final complex route missing: {token}")
-    for fn in ['module_reality_update_sni()', 'module_reality_regenerate_keys()', 'module_vlquic_enable()', 'module_vlquic_disable()', 'module_vlquic_update_cert()', 'module_cforigin_update_cert()', 'module_cforigin_update_edge_port()', 'module_cforigin_toggle_edge_h3()', 'module_cforigin_update_domain()', 'module_socks_update_user()', 'module_socks_update_pass()']:
+    for fn in ['module_reality_update_sni()', 'module_reality_regenerate_keys()', 'module_vlquic_enable()', 'module_vlquic_disable()', 'module_vlquic_update_cert()', 'module_cforigin_update_cert()', 'module_cforigin_update_edge_port()', 'module_cforigin_toggle_edge_h3()', 'module_cforigin_update_domain()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()']:
         assert_true(fn in TEXT, f"final complex action helper missing: {fn}")
-    for marker in ['_unified_dispatch_or_plan "${_runtime}" reality update_sni install_plan_reality_update_sni', '_unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality regenerate_keys', '_unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_domain install_plan_cforigin_update_domain', '_unified_dispatch_or_plan "${_runtime}" socks update_user install_plan_socks_update_user', '_unified_dispatch_or_plan "${_runtime}" socks update_pass install_plan_socks_update_pass']:
+    for marker in ['_unified_dispatch_or_plan "${_runtime}" reality update_sni install_plan_reality_update_sni', '_unified_runtime_only_fn "${_runtime}" _module_action_or_continue reality regenerate_keys', '_unified_dispatch_or_plan "${_runtime}" vlquic update_cert install_plan_vlquic_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_cert install_plan_cforigin_update_cert', '_unified_dispatch_or_plan "${_runtime}" cforigin update_domain install_plan_cforigin_update_domain', '_unified_dispatch_or_plan "${_runtime}" socks update_user install_plan_socks_update_user', '_unified_dispatch_or_plan "${_runtime}" socks update_pass install_plan_socks_update_pass', '_unified_dispatch_or_plan "${_runtime}" http update_user install_plan_http_update_user', '_unified_dispatch_or_plan "${_runtime}" http update_pass install_plan_http_update_pass']:
         assert_true(marker in TEXT, f"unified workbench should route final complex action through shared helpers: {marker}")
 
 def test_single_file_manage_shells_are_dispatch_only():
@@ -576,7 +576,7 @@ def test_single_file_manage_shells_are_dispatch_only():
 
 def test_single_file_menu_render_helpers():
     assert_true('_menu_print_action()' in TEXT and '_menu_print_back()' in TEXT, "menu render should use shared action/back helpers")
-    for body_name in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()']:
+    for body_name in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_vlquic()', 'unified_menu_cforigin()', 'unified_menu_socks()', 'unified_menu_http()']:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true('_menu_print_action' in body, f"{body_name} should use shared action renderer")
         assert_true('_menu_print_back' in body, f"{body_name} should use shared back renderer")
@@ -590,11 +590,11 @@ def test_single_file_module_transaction_helpers():
         assert_true('_module_action_or_continue' in body or '_unified_runtime_toggle' in body, f"{body_name} live actions should route through shared dispatcher/toggle helpers")
     assert_true('_module_apply_if_enabled "${_en}"' in TEXT, "enabled-only config updates should use shared apply helper")
     assert_true('_module_persist_after_optional_apply()' in TEXT, "enabled-only update persistence should use shared optional-apply commit helper")
-    for proto in ['socks', 'vltcp', 'vlquic']:
+    for proto in ['socks', 'http', 'vltcp', 'vlquic']:
         assert_true(f'module_update_listen_action {proto}' in TEXT, f'{proto} listen wrapper/dispatcher should delegate to canonical action')
     canonical_body = TEXT[TEXT.index('module_update_listen_action()'):TEXT.index('\n}\n', TEXT.index('module_update_listen_action()'))]
     assert_true('_module_persist_after_optional_apply "${_en}"' in canonical_body, "canonical listen action should use shared optional-apply commit helper")
-    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_cforigin_update_domain()']:
+    for fn in ['module_reality_update_transport()', 'module_cforigin_update_protocol()', 'module_cforigin_update_path()', 'module_cforigin_update_listen()', 'module_socks_update_user()', 'module_socks_update_pass()', 'module_http_update_user()', 'module_http_update_pass()', 'module_cforigin_update_domain()']:
         body = TEXT[TEXT.index(fn):TEXT.index('\n}\n', TEXT.index(fn))]
         assert_true('_module_persist_after_optional_apply "${_en}"' in body, f"{fn} should use shared optional-apply commit helper")
 
@@ -622,7 +622,7 @@ def test_protocol_links_and_udp_port_input_consistency():
 
 
 def test_state_schema_and_plugin_permission_hardening():
-    assert_true('.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080}' in TEXT, "ports schema initialization must include cforigin and socks")
+    assert_true('.ports = {"argo":18888,"ff":8080,"reality":443,"vltcp":1234,"vlquic":443,"cforigin":28888,"socks":1080,"http":1081}' in TEXT, "ports schema initialization must include cforigin, socks, and http")
     assert_true('_plugin_path_safe()' in TEXT and 'stat -c' in TEXT and '_plugin_path_safe "${PLUGIN_DIR}"' in TEXT, "plugin loader must enforce ownership/mode before source")
     assert_true('val_port "${_value}"' in TEXT and 'legacy 端口字段非法' in TEXT, "legacy port migration must validate bad values explicitly")
 
@@ -639,7 +639,7 @@ def test_commit_helpers_fail_closed_on_firewall_reconcile():
 
 def test_socks5_module_option_and_plugin_contract():
     assert_true('_plugin_write_socks()' in TEXT and '_plugin_write_socks' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "SOCKS5 built-in plugin must be installed")
-    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks"' in TEXT, "module registry must include socks")
+    assert_true('_MODULE_IDS="argo ff reality vltcp vlquic cforigin socks http"' in TEXT, "module registry must include socks and http")
     assert_true('socks)    printf \'SOCKS5\'' in TEXT, "SOCKS5 label missing")
     assert_true('module_summary socks' in TEXT and '_MENU_SD=$(module_summary socks)' in TEXT, "main status must summarize socks")
     assert_true('socks:menu)    unified_menu_socks runtime' in TEXT, "SOCKS5 menu must route directly to unified runtime workbench")
@@ -655,11 +655,23 @@ def test_socks5_module_option_and_plugin_contract():
 
 
 def test_socks5_link_is_generated_and_displayed():
-    assert_true("grep -E '^(vless|trojan|socks)://'" in TEXT, "node output must include v2rayN-compatible SOCKS links, not only vless links")
+    assert_true("grep -E '^(vless|trojan|socks|http)://'" in TEXT, "node output must include v2rayN-compatible proxy links, not only vless links")
     socks_plugin = TEXT[TEXT.index('_plugin_write_socks()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_socks()'))]
     assert_true("socks://%s@%s:%s#SOCKS5" in socks_plugin, "SOCKS plugin should generate v2rayN-compatible socks:// base64(user:pass) links")
     assert_true("base64" in socks_plugin and "tr -d '=\\n'" in socks_plugin, "SOCKS credentials must be URL-safe base64(user:pass) without padding")
     assert_true('protocol:"socks"' in socks_plugin and 'auth:"password"' in socks_plugin, "SOCKS inbound should follow reference socks password-auth implementation")
+
+
+def test_http_proxy_module_option_and_plugin_contract():
+    assert_true('_plugin_write_http()' in TEXT and '_plugin_write_http' in TEXT[TEXT.index('plugin_install_builtins()'):TEXT.index('# ==============================================================================', TEXT.index('plugin_install_builtins()'))], "HTTP proxy built-in plugin must be installed")
+    assert_true('http:menu)     unified_menu_http runtime' in TEXT, "HTTP proxy menu must route directly to unified runtime workbench")
+    for token in ['http:enable)', 'http:disable)', 'http:uninstall)', 'http:update_port)', 'http:update_listen)', 'http:update_auth)', 'http:update_user)', 'http:update_pass)', 'http:show)']:
+        assert_true(token in TEXT, f"HTTP proxy dispatch route missing: {token}")
+    assert_true('"http":    1081' in TEXT and '"http": {' in TEXT, "state schema must include HTTP proxy port/config")
+    http_plugin = TEXT[TEXT.index('_plugin_write_http()'):TEXT.index('_plugin_write_cforigin()', TEXT.index('_plugin_write_http()'))]
+    for token in ['_plg_http_inbound()', 'protocol:"http"', 'users:[{user:$user, pass:$pass}]', 'allowTransparent:false', 'userLevel:0', '_plg_http_ports()', '_plg_http_link()']:
+        assert_true(token in http_plugin, f"HTTP proxy plugin token missing: {token}")
+    assert_true('HTTP 代理为明文 TCP 协议' in TEXT, "HTTP proxy should warn that the inbound is unencrypted")
 
 
 def test_install_plan_menu_is_advanced_install_entry():
@@ -668,7 +680,7 @@ def test_install_plan_menu_is_advanced_install_entry():
     assert_true('install_plan_validate()' in TEXT, "install plan validator missing")
     assert_true('install_execute_current_plan()' in TEXT, "shared install executor missing")
     assert_true('install_plan_menu()' in TEXT, "install plan menu missing")
-    for fn in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_socks()', 'unified_menu_vlquic()', 'unified_menu_cforigin()']:
+    for fn in ['unified_menu_argo()', 'unified_menu_freeflow()', 'unified_menu_reality()', 'unified_menu_vltcp()', 'unified_menu_socks()', 'unified_menu_http()', 'unified_menu_vlquic()', 'unified_menu_cforigin()']:
         assert_true(fn in TEXT, f"unified install/runtime workbench missing: {fn}")
     body = TEXT[TEXT.index('module_xray_install()'):TEXT.index('\n}\n', TEXT.index('module_xray_install()'))]
     assert_true('install_plan_reset_defaults' in body, "module_xray_install should initialize the draft plan")
@@ -677,7 +689,7 @@ def test_install_plan_menu_is_advanced_install_entry():
     for forbidden in ['ask_argo_mode', 'ask_freeflow_mode', 'ask_reality_mode', 'ask_vltcp_mode', 'ask_socks_mode', 'ask_vlquic_mode', 'ask_cforigin_mode']:
         assert_true(forbidden not in body, f"default install entry should not directly chain {forbidden}")
     plan_menu = TEXT[TEXT.index('install_plan_menu()'):TEXT.index('\n}\n', TEXT.index('install_plan_menu()'))]
-    for marker in ['1) unified_menu_argo install', '2) unified_menu_freeflow install', '3) unified_menu_reality install', '4) unified_menu_vltcp install', '5) unified_menu_socks install', '6) unified_menu_vlquic install', '7) unified_menu_cforigin install', '10) install_plan_validate', '11)', 'install_execute_current_plan && return 0']:
+    for marker in ['1) unified_menu_argo install', '2) unified_menu_freeflow install', '3) unified_menu_reality install', '4) unified_menu_vltcp install', '5) unified_menu_socks install', '6) unified_menu_vlquic install', '7) unified_menu_cforigin install', '10) install_plan_validate', '11)', '12) unified_menu_http install', 'install_execute_current_plan && return 0']:
         assert_true(marker in plan_menu, f"advanced install plan route missing: {marker}")
 
 
@@ -709,9 +721,9 @@ def test_recommended_wizard_paths_reset_to_single_plan():
 
 
 def test_install_plan_field_level_submenus_exist_for_common_modules():
-    for fn in ['install_plan_argo_toggle()', 'install_plan_argo_update_protocol()', 'install_plan_argo_update_port()', 'install_plan_argo_update_domain()', 'install_plan_argo_update_auth()', 'install_plan_argo_toggle_xpad()', 'install_plan_ff_toggle()', 'install_plan_ff_update_mode()', 'install_plan_ff_update_port()', 'install_plan_ff_update_host_or_path()', 'install_plan_ff_toggle_xpad()', 'install_plan_reality_toggle()', 'install_plan_reality_update_port()', 'install_plan_reality_update_sni()', 'install_plan_reality_update_transport()', 'install_plan_reality_toggle_xpad()', 'install_plan_vltcp_toggle()', 'install_plan_vltcp_update_port()', 'install_plan_vltcp_update_listen()', 'install_plan_socks_toggle()', 'install_plan_socks_update_port()', 'install_plan_socks_update_listen()', 'install_plan_socks_update_user()', 'install_plan_socks_update_pass()', 'install_plan_vlquic_toggle()', 'install_plan_vlquic_update_port()', 'install_plan_vlquic_update_listen()', 'install_plan_vlquic_update_cert()', 'install_plan_cforigin_toggle()', 'install_plan_cforigin_update_protocol()', 'install_plan_cforigin_update_domain()', 'install_plan_cforigin_update_path()', 'install_plan_cforigin_update_edge_port()', 'install_plan_cforigin_update_origin_port()', 'install_plan_cforigin_update_listen()', 'install_plan_cforigin_toggle_edge_h3()', 'install_plan_cforigin_update_cert()']:
+    for fn in ['install_plan_argo_toggle()', 'install_plan_argo_update_protocol()', 'install_plan_argo_update_port()', 'install_plan_argo_update_domain()', 'install_plan_argo_update_auth()', 'install_plan_argo_toggle_xpad()', 'install_plan_ff_toggle()', 'install_plan_ff_update_mode()', 'install_plan_ff_update_port()', 'install_plan_ff_update_host_or_path()', 'install_plan_ff_toggle_xpad()', 'install_plan_reality_toggle()', 'install_plan_reality_update_port()', 'install_plan_reality_update_sni()', 'install_plan_reality_update_transport()', 'install_plan_reality_toggle_xpad()', 'install_plan_vltcp_toggle()', 'install_plan_vltcp_update_port()', 'install_plan_vltcp_update_listen()', 'install_plan_socks_toggle()', 'install_plan_socks_update_port()', 'install_plan_socks_update_listen()', 'install_plan_socks_update_user()', 'install_plan_socks_update_pass()', 'install_plan_http_toggle()', 'install_plan_http_update_port()', 'install_plan_http_update_listen()', 'install_plan_http_update_user()', 'install_plan_http_update_pass()', 'install_plan_vlquic_toggle()', 'install_plan_vlquic_update_port()', 'install_plan_vlquic_update_listen()', 'install_plan_vlquic_update_cert()', 'install_plan_cforigin_toggle()', 'install_plan_cforigin_update_protocol()', 'install_plan_cforigin_update_domain()', 'install_plan_cforigin_update_path()', 'install_plan_cforigin_update_edge_port()', 'install_plan_cforigin_update_origin_port()', 'install_plan_cforigin_update_listen()', 'install_plan_cforigin_toggle_edge_h3()', 'install_plan_cforigin_update_cert()']:
         assert_true(fn in TEXT, f"field-level install helper missing: {fn}")
-    for body_name, marker in [('unified_menu_argo()', 'Argo 闭环工作台'), ('unified_menu_freeflow()', 'FreeFlow 闭环工作台'), ('unified_menu_reality()', 'Reality 闭环工作台'), ('unified_menu_vltcp()', 'VLESS-TCP 闭环工作台'), ('unified_menu_vlquic()', 'VLESS-XHTTP-H3 闭环工作台'), ('unified_menu_cforigin()', 'CF Origin 闭环工作台'), ('unified_menu_socks()', 'SOCKS5 闭环工作台')]:
+    for body_name, marker in [('unified_menu_argo()', 'Argo 闭环工作台'), ('unified_menu_freeflow()', 'FreeFlow 闭环工作台'), ('unified_menu_reality()', 'Reality 闭环工作台'), ('unified_menu_vltcp()', 'VLESS-TCP 闭环工作台'), ('unified_menu_vlquic()', 'VLESS-XHTTP-H3 闭环工作台'), ('unified_menu_cforigin()', 'CF Origin 闭环工作台'), ('unified_menu_socks()', 'SOCKS5 闭环工作台'), ('unified_menu_http()', 'HTTP 代理闭环工作台')]:
         body = TEXT[TEXT.index(body_name):TEXT.index('\n}\n', TEXT.index(body_name))]
         assert_true(marker in body and '_runtime=0' in body, f"unified workbench marker missing for {body_name}")
 
